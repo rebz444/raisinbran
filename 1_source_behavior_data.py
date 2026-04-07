@@ -1,0 +1,82 @@
+"""Copy behavior data directories for sessions that have photometry data."""
+
+import os
+import shutil
+from pathlib import Path
+
+import pandas as pd
+
+# Configuration
+PHOTOMETRY_LOG_URL = (
+    "https://docs.google.com/spreadsheets/d/1B8KCnku1vQInKOFBuoLeuDND6CEUA4hT6qQ5zuhqvyU/"
+    "export?format=csv&gid=1751471403"
+)
+DATA_DIR = '/Users/rebekahzhang/data/behavior_data'
+EXP = "exp2"
+PHOTOMETRY_FOLDER = Path('/Users/rebekahzhang/data/photometry/behav_analyzed')
+
+
+def main():
+    """Main processing function."""
+    # Load data
+    photometry_log = pd.read_csv(PHOTOMETRY_LOG_URL)
+    data_folder = os.path.join(DATA_DIR, EXP)
+    sessions_training = pd.read_csv(
+        os.path.join(data_folder, f'sessions_training_{EXP}.csv'),
+        index_col=0
+    )
+
+    # Normalize date formats to YYYY-MM-DD before merging
+    photometry_log['date'] = pd.to_datetime(photometry_log['date']).dt.strftime('%Y-%m-%d')
+    sessions_training['date'] = pd.to_datetime(sessions_training['date']).dt.strftime('%Y-%m-%d')
+
+    # Find sessions that have both training and photometry data
+    sessions_photometry = pd.merge(
+        sessions_training,
+        photometry_log[['date', 'mouse']],
+        on=['date', 'mouse'],
+        how='inner'
+    )
+    sessions_photometry.to_csv(os.path.join(PHOTOMETRY_FOLDER, f'sessions_photometry_{EXP}.csv'))
+
+    # Report photometry sessions with no matching behavior data
+    unmatched = photometry_log[['date', 'mouse']].merge(
+        sessions_training[['date', 'mouse']],
+        on=['date', 'mouse'],
+        how='left',
+        indicator=True
+    )
+    no_behavior = unmatched[unmatched['_merge'] == 'left_only'][['date', 'mouse']]
+    if not no_behavior.empty:
+        print(f"\n{len(no_behavior)} photometry session(s) with no matching behavior data:")
+        for _, row in no_behavior.iterrows():
+            print(f"  {row['mouse']}  {row['date']}")
+    else:
+        print("All photometry sessions have matching behavior data.")
+
+    # Create destination folder
+    os.makedirs(PHOTOMETRY_FOLDER, exist_ok=True)
+
+    # Copy directories
+    copied_count = 0
+    for src_dir in sessions_photometry['dir']:
+        src_path = os.path.join(data_folder, src_dir)
+        dest_path = os.path.join(PHOTOMETRY_FOLDER, os.path.basename(src_dir))
+
+        if not os.path.exists(src_path):
+            print(f"Warning: Source directory does not exist: {src_path}")
+            continue
+
+        if os.path.exists(dest_path):
+            print(f"Skipped: {os.path.basename(src_dir)} (already exists)")
+            continue
+
+        shutil.copytree(src_path, dest_path)
+        copied_count += 1
+        print(f"Copied: {os.path.basename(src_dir)}")
+
+    print(f"\nCompleted: Copied {copied_count} of {len(sessions_photometry)} directories.")
+
+
+if __name__ == '__main__':
+    main()
