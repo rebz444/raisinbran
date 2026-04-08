@@ -2,18 +2,14 @@
 
 import os
 import shutil
-from pathlib import Path
 
 import pandas as pd
 
-# Configuration
-PHOTOMETRY_LOG_URL = (
-    "https://docs.google.com/spreadsheets/d/1B8KCnku1vQInKOFBuoLeuDND6CEUA4hT6qQ5zuhqvyU/"
-    "export?format=csv&gid=1751471403"
-)
-DATA_DIR = '/Users/rebekahzhang/data/behavior_data'
+from config import BEHAVIOR_DATA_DIR, BEHAV_DIR, PHOTOMETRY_LOG_URL
+
+DATA_DIR = BEHAVIOR_DATA_DIR
 EXP = "exp2"
-PHOTOMETRY_FOLDER = Path('/Users/rebekahzhang/data/photometry/behav_analyzed')
+PHOTOMETRY_FOLDER = BEHAV_DIR
 
 
 def main():

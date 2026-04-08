@@ -23,14 +23,8 @@ Outputs:
 - trial_metrics.csv
 - figures/*.png
 
-Usage example:
-python photometry_wait_analysis.py \
-  --trials trials_analyzed_2026-01-13_11-32-01_RZ083.csv \
-  --events events_processed_2026-01-13_11-32-01_RZ083.csv \
-  --phot G4.csv \
-  --signal_col dff_zscored \
-  --outdir ./wait_analysis_out \
-  --impulsive_sec 0.25
+Usage:
+Set BATCH and file paths in the IDE RUN CONFIG block at the bottom of this file, then run.
 
 Notes on timebases:
 - This script assumes photometry t_sec is aligned to "session seconds since first trial start".
@@ -44,8 +38,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Default processed output path (from 2_fp_processing_updated.py)
-DEFAULT_PROCESSED_DIR = Path("/Users/rebekahzhang/data/photometry/processed_output")
+from config import PROCESSED_OUT
+
+
+def _find_file(patterns: List[str]) -> Optional[Path]:
+    """Search the current directory for the first file matching any of the given glob patterns."""
+    for pattern in patterns:
+        matches = sorted(Path(".").glob(pattern))
+        if matches:
+            return matches[0]
+    return None
 
 
 # ----------------------------
@@ -390,28 +392,15 @@ class AnalysisConfig:
     seed: int = 0
 
 
-def main():
-    # Use provided paths or search in current directory
-    trials_file = Path(args.trials) if args.trials else _find_file(["trials_analyzed_*.csv", "*trials*analyzed*.csv"])
-    events_file = Path(args.events) if args.events else _find_file(["events_processed_*.csv", "*events*processed*.csv"])
-    phot_file = Path(args.phot) if args.phot else _find_file(["G4.csv", "*G4*.csv", "*phot*processed*.csv", "photometry_long.csv"])
-
-
-    cfg = AnalysisConfig(
-        trials_file=trials_file,
-        events_file=events_file,
-        phot_file=phot_file,
-        outdir=Path(args.outdir),
-        signal_col=args.signal_col,
-        iso_col=args.iso_col,
-        impulsive_sec=args.impulsive_sec,
-        pre_decision_buffer=args.pre_decision_buffer,
-        t_min_after_align=args.t_min_after_align,
-        n_perm=args.n_perm,
-        seed=args.seed,
-    )
+def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
+    """
+    Run the full wait-time analysis for one session.
+    Returns a summary dict of key per-session statistics.
+    """
+    label = f"[{session_label}] " if session_label else ""
 
     cfg.outdir.mkdir(parents=True, exist_ok=True)
+    summary: dict = {"session": session_label}
 
     # Load data
     trials = pd.read_csv(cfg.trials_file)
@@ -485,8 +474,8 @@ def main():
             # time-reversal slope control (signal only)
             if tt.has_decision and np.isfinite(tt.decision) and np.isfinite(getattr(tt, align)):
                 align_t = getattr(tt, align)
-                start = align_t + args.t_min_after_align
-                end = tt.decision - args.pre_decision_buffer
+                start = align_t + cfg.t_min_after_align
+                end = tt.decision - cfg.pre_decision_buffer
                 seg = phot_trial[(phot_trial["trial_time"] >= start) & (phot_trial["trial_time"] <= end)]
                 if len(seg) >= 5:
                     t = seg["trial_time"].to_numpy()
@@ -501,20 +490,20 @@ def main():
             tr_row[f"slope_{align}_time_reversed"] = a_rev
 
         # Mean DA in windows before decision (signal and iso)
-        means = compute_mean_in_windows(phot_trial, tt, signal_col=args.signal_col, windows=windows, relative_to="decision")
-        means_iso = compute_mean_in_windows(phot_trial, tt, signal_col=args.iso_col, windows=windows, relative_to="decision")
+        means = compute_mean_in_windows(phot_trial, tt, signal_col=cfg.signal_col, windows=windows, relative_to="decision")
+        means_iso = compute_mean_in_windows(phot_trial, tt, signal_col=cfg.iso_col, windows=windows, relative_to="decision")
         tr_row.update(means)
         tr_row.update({k + "_iso": v for k, v in means_iso.items()})
 
         rows.append(tr_row)
 
     metrics = pd.DataFrame(rows)
-    metrics.to_csv(outdir / "trial_metrics.csv", index=False)
+    metrics.to_csv(cfg.outdir / "trial_metrics.csv", index=False)
 
     # ----------------------------
     # Core correlations (single-session)
     # ----------------------------
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(cfg.seed)
 
     def effect_slope_vs_wait(align: str, use_iso: bool = False, shuffle: Optional[str] = None) -> float:
         """
@@ -547,7 +536,7 @@ def main():
         return float(np.corrcoef(x, y)[0, 1])
 
     # Figure: slope vs wait scatter
-    figdir = outdir / "figures"
+    figdir = cfg.outdir / "figures"
     figdir.mkdir(exist_ok=True, parents=True)
 
     for align in ["cue_off", "cue_on"]:
@@ -572,8 +561,8 @@ def main():
         )[0, 1] if len(df) >= 2 and np.nanstd(df[f"slope_{align}_time_reversed"].to_numpy(float)) > 0 else np.nan
 
         # Null distributions
-        null_perm = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="perm") for _ in range(args.n_perm)])
-        null_csh = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="cshift") for _ in range(args.n_perm)])
+        null_perm = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="perm") for _ in range(cfg.n_perm)])
+        null_csh = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="cshift") for _ in range(cfg.n_perm)])
 
         plt.figure(figsize=(7, 4))
         plt.hist(null_perm[np.isfinite(null_perm)], bins=40, alpha=0.6, label="perm null")
@@ -627,16 +616,16 @@ def main():
                 trial_times=trial_times,
                 trials=trials,
                 align=align,
-                signal_col=args.signal_col,
+                signal_col=cfg.signal_col,
                 t_grid=t_grid,
                 min_fraction_waiting=0.8,
-                pre_decision_buffer=args.pre_decision_buffer,
+                pre_decision_buffer=cfg.pre_decision_buffer,
             )
         except Exception as e:
             print(f"[WARN] time-resolved correlation failed for {align}: {e}")
             continue
 
-        trcorr.to_csv(outdir / f"time_resolved_corr_{align}.csv", index=False)
+        trcorr.to_csv(cfg.outdir / f"time_resolved_corr_{align}.csv", index=False)
 
         plt.figure(figsize=(8, 4))
         plt.plot(trcorr["t"], trcorr["r"])
@@ -646,8 +635,92 @@ def main():
         plt.title(f"Time-resolved correlation ({align})")
         savefig(figdir / f"time_resolved_corr_{align}.png")
 
-    print(f"Done. Wrote:\n- {outdir/'trial_metrics.csv'}\n- {figdir}/*.png")
+    print(f"{label}Done. Wrote:\n- {cfg.outdir / 'trial_metrics.csv'}\n- {figdir}/*.png")
+    return summary
+
 
 
 if __name__ == "__main__":
-    main()
+    # ----------------------------------------------------------------
+    # IDE RUN CONFIG — edit these instead of using the terminal
+    # ----------------------------------------------------------------
+    BATCH = True          # True = all sessions, False = single session below
+
+    # Single-session paths (only used when BATCH = False)
+    TRIALS_FILE = None    # e.g. Path("/Volumes/T7 Shield/photometry/behav_analyzed/2026-01-13_11-32-01_RZ083/trials_analyzed_2026-01-13_11-32-01_RZ083.csv")
+    EVENTS_FILE = None    # e.g. Path("/Volumes/T7 Shield/photometry/behav_analyzed/2026-01-13_11-32-01_RZ083/events_processed_2026-01-13_11-32-01_RZ083.csv")
+    PHOT_FILE   = None    # e.g. Path("/Volumes/T7 Shield/photometry/processed_output/RZ083_20260113_113201/G4.csv")
+    OUTDIR      = None    # None = default (wait_analysis_out for single, PROCESSED_OUT/<id>/wait_analysis for batch)
+
+    # Analysis settings
+    SIGNAL_COL          = "dff_zscored"
+    ISO_COL             = "iso"
+    IMPULSIVE_SEC       = 0.25
+    PRE_DECISION_BUFFER = 0.2
+    T_MIN_AFTER_ALIGN   = 0.3
+    N_PERM              = 1000
+    SEED                = 0
+    # ----------------------------------------------------------------
+
+    if BATCH:
+        from config import BEHAV_DIR, PHOTO_ROOT, PROCESSED_OUT
+        from utils import get_grab_channel, load_merged_log, load_photometry_log
+
+        merged_log = load_merged_log()
+        photometry_log = load_photometry_log()
+        all_summaries = []
+        base_outdir = Path(OUTDIR) if OUTDIR else None
+
+        for _, session_info in merged_log.iterrows():
+            session_id = str(session_info["session_id"])
+            behav_subdir = str(session_info["dir"])
+            mouse = str(session_info["mouse"])
+            date = str(session_info["date"])
+
+            grab_channel = get_grab_channel(mouse, date, photometry_log)
+            if grab_channel is None:
+                print(f"[{session_id}] Skipping: no striatum GRAB channel in photometry log")
+                continue
+
+            trials_file = BEHAV_DIR / behav_subdir / f"trials_analyzed_{behav_subdir}.csv"
+            events_file = BEHAV_DIR / behav_subdir / f"events_processed_{behav_subdir}.csv"
+            phot_file = PROCESSED_OUT / session_id / f"{grab_channel}.csv"
+
+            if not trials_file.exists() or not events_file.exists() or not phot_file.exists():
+                print(f"[{session_id}] Skipping: missing input files")
+                continue
+
+            outdir = (base_outdir / session_id) if base_outdir else (PROCESSED_OUT / session_id / "wait_analysis")
+            cfg = AnalysisConfig(
+                trials_file=trials_file, events_file=events_file, phot_file=phot_file,
+                outdir=outdir, signal_col=SIGNAL_COL, iso_col=ISO_COL,
+                impulsive_sec=IMPULSIVE_SEC, pre_decision_buffer=PRE_DECISION_BUFFER,
+                t_min_after_align=T_MIN_AFTER_ALIGN, n_perm=N_PERM, seed=SEED,
+            )
+            try:
+                summary = run_session(cfg, session_label=session_id)
+                summary.update({"mouse": mouse, "date": date, "grab_channel": grab_channel})
+                all_summaries.append(summary)
+            except Exception as e:
+                print(f"[{session_id}] ERROR: {e}")
+
+        if all_summaries:
+            out_csv = (base_outdir or PHOTO_ROOT) / "wait_analysis_summary_all_sessions.csv"
+            pd.DataFrame(all_summaries).to_csv(out_csv, index=False)
+            print(f"\nBatch done. Global summary: {out_csv}")
+        else:
+            print("No sessions processed.")
+
+    else:
+        # Single-session mode
+        trials_file = Path(TRIALS_FILE) if TRIALS_FILE else _find_file(["trials_analyzed_*.csv", "*trials*analyzed*.csv"])
+        events_file = Path(EVENTS_FILE) if EVENTS_FILE else _find_file(["events_processed_*.csv", "*events*processed*.csv"])
+        phot_file = Path(PHOT_FILE) if PHOT_FILE else _find_file(["G4.csv", "*G4*.csv", "*phot*processed*.csv", "photometry_long.csv"])
+        outdir = Path(OUTDIR) if OUTDIR else Path("wait_analysis_out")
+        cfg = AnalysisConfig(
+            trials_file=trials_file, events_file=events_file, phot_file=phot_file,
+            outdir=outdir, signal_col=SIGNAL_COL, iso_col=ISO_COL,
+            impulsive_sec=IMPULSIVE_SEC, pre_decision_buffer=PRE_DECISION_BUFFER,
+            t_min_after_align=T_MIN_AFTER_ALIGN, n_perm=N_PERM, seed=SEED,
+        )
+        run_session(cfg)

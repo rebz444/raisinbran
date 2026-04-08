@@ -9,23 +9,25 @@ from scipy.optimize import curve_fit
 from datetime import datetime
 from pathlib import Path
 
+from config import (
+    PHOTO_ROOT,
+    FP_DIR,
+    FP_DIR_FLATTENED,
+    PROCESSED_OUT,
+    QC_GATE_ENABLED,
+    QC_STOP_ON_FAIL,
+    QC_MIN_SAMPLES_PER_STATE,
+)
+
 # --- Configuration ---
-# Use Path for modern file handling
-PHOTOMETRY_DIR = Path('/Users/rebekahzhang/data/photometry')
-FP_DIR = PHOTOMETRY_DIR / 'fp'
-FP_DIR_FLATTENED = PHOTOMETRY_DIR / 'fp_flattened'
-OUT_DIR = PHOTOMETRY_DIR / "processed_output"
+PHOTOMETRY_DIR = PHOTO_ROOT
+OUT_DIR = PROCESSED_OUT
+
+REGENERATE = False  # Set to True to reprocess already-processed sessions
 
 # Ensure directories exist
 FP_DIR_FLATTENED.mkdir(parents=True, exist_ok=True)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-POST_LOWPASS_HZ = None
-
-# QC gate: always generate raw deinterleaved plots before processing.
-QC_GATE_ENABLED = True
-QC_STOP_ON_FAIL = False  # if True, abort a session when raw data look pathological
-QC_MIN_SAMPLES_PER_STATE = 50
 # --- 1. Signal Processing Logic ---
 
 class SignalProcessor:
@@ -218,7 +220,7 @@ def match_sessions(data_dir):
         
         for b in candidates:
             diff = abs((fp['datetime'] - b['datetime']).total_seconds())
-            if diff < 60 and diff < min_diff:
+            if diff < 300 and diff < min_diff:
                 min_diff = diff
                 best_match = b
         
@@ -713,7 +715,7 @@ def main():
     # 3. Process Loops
     for idx, session in sessions_df.iterrows():
         print(f"Processing {idx+1}/{len(sessions_df)}: {session['session_id']}")
-        process_session(session, FP_DIR_FLATTENED, OUT_DIR, regenerate=True)
+        process_session(session, FP_DIR_FLATTENED, OUT_DIR, regenerate=REGENERATE)
         
     print("All done.")
 

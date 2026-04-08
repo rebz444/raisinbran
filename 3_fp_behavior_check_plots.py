@@ -13,107 +13,16 @@ from typing import Dict
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ============================
-# CONFIGURATION
-# ============================
-PHOTO_ROOT = Path("/Users/rebekahzhang/data/photometry")
-PROCESSED_OUT = PHOTO_ROOT / "processed_output"
-BEHAV_DIR = PHOTO_ROOT / "behav_analyzed"
-MATCHED_SESSIONS_CSV = PHOTO_ROOT / "matched_sessions.csv"
-BEHAV_LOG_CSV = BEHAV_DIR / "sessions_photometry_exp2.csv"
-OUT_PLOTS_DIR = PHOTO_ROOT / "trial_plots"
-
-PHOTOMETRY_LOG_URL = (
-    "https://docs.google.com/spreadsheets/d/1B8KCnku1vQInKOFBuoLeuDND6CEUA4hT6qQ5zuhqvyU/"
-    "export?format=csv&gid=1751471403"
+from config import (
+    BEHAV_DIR,
+    CHANNEL_COLORS,
+    DEFAULT_SIGNAL_COL,
+    OUT_PLOTS_DIR,
+    PROCESSED_OUT,
 )
+from utils import assign_trials_to_photometry, get_channels_for_session, load_merged_log, load_photometry_log
 
-SIGNAL_COL = "dff_zscored"  # or "dff_filtered"
-
-# Channel pairs (red, green) per fiber number, keyed by total fiber count
-_FIBER_CHANNEL_MAP = {
-    2: {1: ("R0", "G2"), 2: ("R1", "G3")},
-    4: {1: ("R0", "G4"), 2: ("R1", "G5"), 3: ("R2", "G6"), 4: ("R3", "G7")},
-}
-
-DEFAULT_CHANNEL_COLORS = {
-    "R0": "#e74c3c",
-    "R1": "#c0392b",
-    "R2": "#ff6b35",
-    "R3": "#ff006e",
-    "G2": "#27ae60",
-    "G3": "#4cc9f0",
-    "G4": "#2ecc71",
-    "G5": "#1abc9c",
-    "G6": "#16a085",
-    "G7": "#0e6655",
-}
-
-# ============================
-# HELPERS
-# ============================
-
-def get_channels_for_session(mouse: str, date: str, photometry_log: pd.DataFrame) -> Dict[str, str]:
-    """
-    Look up the photometry log for a session and return a dict of {channel: label}.
-    Label format: {channel}_{side}_{area}_{sensor}  e.g. "R0_l_v1_rCaMP"
-    - str/striatum fibers: include both red and green channels
-    - v1 fibers: include red channel only
-    Returns empty dict if the session is not found in the log.
-    """
-    row = photometry_log[
-        (photometry_log["mouse"] == mouse) & (photometry_log["date"] == date)
-    ]
-    if row.empty:
-        return {}
-
-    row = row.iloc[0]
-
-    # Count active fibers (non-null area)
-    n_fibers = sum(
-        1 for i in range(1, 5)
-        if pd.notna(row.get(f"fiber_{i}_area")) and str(row.get(f"fiber_{i}_area")).strip() != ""
-    )
-
-    if n_fibers not in _FIBER_CHANNEL_MAP:
-        return {}
-
-    channel_labels = {}
-    for fiber_num, (r_ch, g_ch) in _FIBER_CHANNEL_MAP[n_fibers].items():
-        area = str(row.get(f"fiber_{fiber_num}_area", "")).strip().lower()
-        side = str(row.get(f"fiber_{fiber_num}_side", "")).strip().lower()
-        sensor = str(row.get(f"fiber_{fiber_num}_sensor", "")).strip()
-        if area in ("str", "striatum"):
-            channel_labels[r_ch] = f"{r_ch}_{side}_{area}_{sensor}"
-            channel_labels[g_ch] = f"{g_ch}_{side}_{area}_{sensor}"
-        elif area == "v1":
-            channel_labels[r_ch] = f"{r_ch}_{side}_{area}_{sensor}"
-
-    return channel_labels
-
-
-def assign_trials_to_photometry(phot: pd.DataFrame, trials: pd.DataFrame) -> pd.DataFrame:
-    """Align photometry to trials and compute per-sample trial time."""
-    trials = trials.copy()
-    session_first_start = float(trials.iloc[0]["start_time"])
-    trials["start_time"] = trials["start_time"].astype(float) - session_first_start
-    trials["end_time"] = trials["end_time"].astype(float) - session_first_start
-
-    phot_sorted = phot.sort_values("t_sec").reset_index(drop=True)
-    trials_sorted = trials.sort_values("start_time").reset_index(drop=True)
-
-    merged = pd.merge_asof(
-        phot_sorted,
-        trials_sorted,
-        left_on="t_sec",
-        right_on="start_time",
-        direction="backward",
-    )
-
-    merged = merged[merged["t_sec"] <= merged["end_time"]].reset_index(drop=True)
-    merged["trial_time"] = merged["t_sec"] - merged["start_time"]
-    merged["decision_time"] = merged["bg_length"] + merged["time_waited"]
-    return merged
+SIGNAL_COL = DEFAULT_SIGNAL_COL
 
 
 def plot_trial(
@@ -124,7 +33,7 @@ def plot_trial(
     title: str,
     save_path: Path,
 ) -> None:
-    channel_colors = DEFAULT_CHANNEL_COLORS
+    channel_colors = CHANNEL_COLORS
 
     fig = plt.figure(figsize=(14, 6))
 
@@ -169,19 +78,11 @@ def plot_trial(
     plt.close(fig)
 
 
-def _load_merged_log() -> pd.DataFrame:
-    data_log = pd.read_csv(MATCHED_SESSIONS_CSV)
-    behav_log = pd.read_csv(BEHAV_LOG_CSV, index_col=0)
-    merged_log = pd.merge(data_log, behav_log, on=["mouse", "date"], how="inner")
-    merged_log.to_csv(PHOTO_ROOT / "sessions_dff_behav_merged.csv")
-    return merged_log
-
-
 def process(regenerate: bool = False) -> None:
     """Merge photometry with trial data and save photometry_with_trial_data.csv per session.
     If regenerate=False, skips sessions where the output already exists.
     """
-    merged_log = _load_merged_log()
+    merged_log = load_merged_log()
 
     for _, session_info in merged_log.iterrows():
         session_id = str(session_info["session_id"])
@@ -209,13 +110,14 @@ def process(regenerate: bool = False) -> None:
     print("Processing done.")
 
 
-def plot() -> None:
-    """Plot per-trial photometry traces using saved photometry_with_trial_data.csv."""
+def plot(regenerate: bool = False) -> None:
+    """Plot per-trial photometry traces using saved photometry_with_trial_data.csv.
+    If regenerate=False, skips trials where the plot already exists.
+    """
     OUT_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    merged_log = _load_merged_log()
+    merged_log = load_merged_log()
 
-    photometry_log = pd.read_csv(PHOTOMETRY_LOG_URL)
-    photometry_log["date"] = pd.to_datetime(photometry_log["date"]).dt.strftime("%Y-%m-%d")
+    photometry_log = load_photometry_log()
 
     for _, session_info in merged_log.iterrows():
         session_id = str(session_info["session_id"])
@@ -228,7 +130,7 @@ def plot() -> None:
             print(f"Skipping {session_id}: run process() first or missing events")
             continue
 
-        merged = pd.read_csv(merged_path)
+        merged = pd.read_csv(merged_path, low_memory=False)
         events = pd.read_csv(events_path, index_col=0)
 
         signal_col = SIGNAL_COL if SIGNAL_COL in merged.columns else "dff_filtered"
@@ -248,6 +150,8 @@ def plot() -> None:
                 continue
 
             save_path = session_plot_dir / f"trial_{int(trial_num):03d}.png"
+            if not regenerate and save_path.exists():
+                continue
             title = f"{session_info['mouse']} {session_info['date']} - Trial {int(trial_num)}"
             plot_trial(
                 trial_sig=trial_sig,
@@ -264,5 +168,5 @@ def plot() -> None:
 
 
 if __name__ == "__main__":
-    # process(regenerate=False)
-    plot()
+    process(regenerate=False)
+    plot(regenerate=False)
