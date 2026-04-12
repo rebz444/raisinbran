@@ -1,33 +1,47 @@
+"""
+Step 1: Fiber Photometry Signal Processing
+===========================================
+Matches FP and behavior CSV files by mouse/timestamp, corrects for
+photobleaching using isosbestic (415 nm) or self-bleach models, computes
+dF/F and z-scored traces, runs QC metrics, and saves per-session outputs.
 
-import shutil
+Outputs per session (saved to fp_processed/{session_id}/):
+    photometry_long.csv         — long-form dF/F trace (all channels)
+    {channel}.csv               — per-channel trace
+    channel_summary.csv         — sampling rate, n_samples, duration
+    correction_quality.csv      — QC metrics and quality tier per channel
+    qc/{channel}_qc.png         — 4-panel QC diagnostic plot
+
+Run before:
+    2_fp_qc_summary.py
+    3_fp_behavior_align.py
+"""
+
 import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt
 from scipy.optimize import curve_fit
+from scipy.stats import pearsonr, skew
 from datetime import datetime
 from pathlib import Path
 
 from config import (
-    PHOTO_ROOT,
     FP_DIR,
-    FP_DIR_FLATTENED,
     PROCESSED_OUT,
     QC_GATE_ENABLED,
     QC_STOP_ON_FAIL,
     QC_MIN_SAMPLES_PER_STATE,
+    get_channel_color,
 )
+from quality_tiers import compute_quality_tier
+from utils import get_channels_for_session, load_photometry_log, update_session_log
 
 # --- Configuration ---
-PHOTOMETRY_DIR = PHOTO_ROOT
-OUT_DIR = PROCESSED_OUT
-
 REGENERATE = False  # Set to True to reprocess already-processed sessions
+POST_LOWPASS_HZ = None  # Set to e.g. 10.0 to apply a post-hoc lowpass filter on dF/F; None = no filter
 
-# Ensure directories exist
-FP_DIR_FLATTENED.mkdir(parents=True, exist_ok=True)
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 # --- 1. Signal Processing Logic ---
 
 class SignalProcessor:
@@ -71,7 +85,7 @@ class SignalProcessor:
             # Optimized weighted least squares:
             # X is (N, 2), w is (N,)
             # Broadcasting: X * w[:, None] multiplies each row of X by weight w
-                        # Weighted least squares uses sqrt(weights)
+            # Weighted least squares uses sqrt(weights)
             sw = np.sqrt(w)
             WX = X * sw[:, np.newaxis]
             wy = y * sw
@@ -149,24 +163,169 @@ class SignalProcessor:
         return scaled_bleach, normalized, dff
 
 
-# --- 2. Data Handling & Utilities ---
+# --- 2. Correction Quality Metrics ---
 
-def flatten_directory(source_dir, target_dir):
+def compute_edge_mismatch(sig, baseline):
     """
-    Copies all .csv files from source_dir (recursive) to target_dir (flat).
+    Detect if the baseline fit is poor at session start but good at the end.
+    Flags sessions that are candidates for cropping the first N seconds.
     """
-    source_dir = Path(source_dir)
-    target_dir = Path(target_dir)
-    
-    copied = 0
-    for file_path in source_dir.rglob("*.csv"):
-        target_path = target_dir / file_path.name
-        if not target_path.exists():
-            shutil.copy2(file_path, target_path)
-            copied += 1
-            
-    if copied > 0:
-        print(f"Flattening complete. Copied {copied} new files.")
+    n = len(sig)
+    seg = n // 10
+
+    if seg < 10:
+        return {"r2_start": float("nan"), "r2_end": float("nan"), "flag_start_mismatch": False}
+
+    residual = sig - baseline
+
+    ss_res_start = np.sum(residual[:seg] ** 2)
+    ss_tot_start = np.sum((sig[:seg] - np.mean(sig[:seg])) ** 2)
+    r2_start = 1 - ss_res_start / ss_tot_start if ss_tot_start > 1e-12 else 0.0
+
+    ss_res_end = np.sum(residual[-seg:] ** 2)
+    ss_tot_end = np.sum((sig[-seg:] - np.mean(sig[-seg:])) ** 2)
+    r2_end = 1 - ss_res_end / ss_tot_end if ss_tot_end > 1e-12 else 0.0
+
+    flag = (r2_start < 0.70) and (r2_end > 0.85) and (r2_end - r2_start > 0.20)
+
+    return {
+        "r2_start": float(r2_start),
+        "r2_end": float(r2_end),
+        "flag_start_mismatch": bool(flag),
+    }
+
+
+# Flag thresholds (tunable)
+QC_R2_BASELINE_MIN    = 0.70   # R² of baseline fit below this = poor tracking
+QC_DFF_SLOPE_MAX      = 5e-4   # |dff slope| > this (ΔF/F per second) = residual drift
+QC_DRIFT_DELTA_Z_MAX  = 0.50   # |first-vs-last chunk delta / std| > this = drift
+QC_ISO_DFF_CORR_MAX   = 0.15   # |r(iso, dff)| > this = incomplete iso correction
+QC_OUTLIER_FRAC_MAX   = 0.005  # fraction of |dff_zscored| > 5 above this = artifact
+QC_SKEWNESS_MAX       = 2.0    # |skew(dff)| above this = asymmetric distribution
+
+
+def compute_correction_metrics(sig, iso, scaled_bleach, dff, dff_zscored, ts_sig, fs, note, channel_name=""):
+    """
+    Compute quantitative quality metrics for a single channel's bleaching correction.
+
+    Returns a flat dict of scalar metrics and boolean flags. All inputs are numpy arrays
+    (iso may be empty for red/self-bleach channels).
+
+    Metrics
+    -------
+    r2_baseline      : R² of scaled_bleach vs raw sig. Fraction of slow-trend variance
+                       captured by the baseline model.
+    dff_slope        : Linear slope of dff vs time (ΔF/F per second). Near-zero = good.
+    drift_delta_z    : (median(dff[last 10%]) - median(dff[first 10%])) / std(dff).
+                       Catches nonlinear residual drift.
+    r_iso_sig        : Pearson r(iso, sig) before correction (green only; NaN for red).
+    r_iso_dff        : Pearson r(iso, dff) after correction (green only; NaN for red).
+                       Near-zero = iso correction fully removed shared variance.
+    noise_std        : std of dff - lowpass(dff, 2 Hz). Estimates high-freq noise floor.
+    outlier_frac     : Fraction of samples where |dff_zscored| > 5.
+    skewness         : scipy.stats.skew(dff). ~0 for well-behaved distributions.
+    flag_*           : Boolean flags derived from the thresholds above.
+    """
+    metrics = {}
+
+    # --- A. Baseline tracking quality ---
+    sig_var = np.var(sig - np.mean(sig))
+    if sig_var > 0:
+        resid_var = np.var(sig - scaled_bleach)
+        metrics["r2_baseline"] = float(1.0 - resid_var / sig_var)
+    else:
+        metrics["r2_baseline"] = float("nan")
+
+    metrics.update(compute_edge_mismatch(sig, scaled_bleach))
+
+    # --- B. Residual temporal drift ---
+    t = np.asarray(ts_sig, dtype=float)
+    t_norm = t - t[0]  # seconds from start
+    if len(t_norm) > 1:
+        slope, _ = np.polyfit(t_norm, dff, 1)
+        metrics["dff_slope"] = float(slope)
+    else:
+        metrics["dff_slope"] = float("nan")
+
+    chunk = max(1, len(dff) // 10)
+    dff_std = np.std(dff)
+    if dff_std > 0:
+        delta = np.median(dff[-chunk:]) - np.median(dff[:chunk])
+        metrics["drift_delta_z"] = float(delta / dff_std)
+    else:
+        metrics["drift_delta_z"] = float("nan")
+
+    # --- C. Iso–dff residual correlation (green channels only) ---
+    iso = np.asarray(iso)
+    if len(iso) == len(sig) and len(iso) > 2:
+        try:
+            metrics["r_iso_sig"] = float(pearsonr(iso, sig)[0])
+        except Exception:
+            metrics["r_iso_sig"] = float("nan")
+        try:
+            metrics["r_iso_dff"] = float(pearsonr(iso, dff)[0])
+        except Exception:
+            metrics["r_iso_dff"] = float("nan")
+    else:
+        metrics["r_iso_sig"] = float("nan")
+        metrics["r_iso_dff"] = float("nan")
+
+    # --- D. Noise and distribution quality ---
+    try:
+        proc = SignalProcessor()
+        dff_lp = proc.butter_lowpass(dff, fs, cutoff_hz=2.0)
+        metrics["noise_std"] = float(np.std(dff - dff_lp))
+    except Exception:
+        metrics["noise_std"] = float("nan")
+
+    metrics["outlier_frac"] = float(np.mean(np.abs(dff_zscored) > 5))
+    metrics["skewness"] = float(skew(dff)) if len(dff) > 2 else float("nan")
+
+    # --- Fallback/method flags from note string ---
+    metrics["flag_iso_unreliable"]  = "iso_unreliable_fallback" in note
+    metrics["flag_fit_failed"]      = "fit_failed_fallback" in note
+    metrics["flag_self_bleach_560"] = "self_bleach_560" in note
+
+    # --- Threshold flags ---
+    r2 = metrics["r2_baseline"]
+    metrics["flag_poor_baseline"]   = (not np.isnan(r2)) and (r2 < QC_R2_BASELINE_MIN)
+    slope = metrics["dff_slope"]
+    metrics["flag_residual_drift"]  = (not np.isnan(slope)) and (abs(slope) > QC_DFF_SLOPE_MAX)
+    ddz = metrics["drift_delta_z"]
+    metrics["flag_drift_delta"]     = (not np.isnan(ddz)) and (abs(ddz) > QC_DRIFT_DELTA_Z_MAX)
+    r_id = metrics["r_iso_dff"]
+    metrics["flag_iso_dff_corr"]    = (not np.isnan(r_id)) and (abs(r_id) > QC_ISO_DFF_CORR_MAX)
+    metrics["flag_outliers"]        = metrics["outlier_frac"] > QC_OUTLIER_FRAC_MAX
+    sk = metrics["skewness"]
+    metrics["flag_skewed"]          = (not np.isnan(sk)) and (abs(sk) > QC_SKEWNESS_MAX)
+
+    # Summary: any flag raised (flag_self_bleach_560 is expected for all red channels,
+    # not a problem, so it is excluded from the any_flag rollup)
+    flag_cols = [v for k, v in metrics.items()
+                 if k.startswith("flag_") and k != "flag_self_bleach_560"]
+    metrics["any_flag"] = any(flag_cols)
+
+    # --- E. Running-mean range (slow modulation amplitude) ---
+    window_samples = int(30 * fs)
+    window_samples = max(3, min(window_samples, len(dff) // 3))
+    kernel = np.ones(window_samples) / window_samples
+    dff_smooth = np.convolve(dff, kernel, mode='same')
+    edge = window_samples // 2
+    if edge > 0 and len(dff_smooth) > 2 * edge:
+        dff_smooth = dff_smooth[edge:-edge]
+    metrics["running_mean_range"] = float(
+        (np.max(dff_smooth) - np.min(dff_smooth)) / (np.std(dff) + 1e-12)
+    )
+
+    # --- Quality tier ---
+    metrics["quality_tier"], tier_reasons = compute_quality_tier(metrics, note, channel_name, fs=fs, dff=dff)
+    metrics["tier_reasons"] = "|".join(tier_reasons) if tier_reasons else ""
+
+    return metrics
+
+
+# --- 3. Data Handling & Utilities ---
+
 
 def get_session_info(filename):
     """
@@ -195,54 +354,63 @@ def get_session_info(filename):
 
 def match_sessions(data_dir):
     """
-    Matches FP and Behavior files based on Mouse ID and Timestamp (within 60s).
+    Pairs each FP_*.csv with its Behav_*.csv by mouse ID and nearest timestamp (within 300s).
+    Searches recursively so no flattening step is needed.
+    Stores absolute paths so process_session can load files directly.
     """
     data_dir = Path(data_dir)
-    files = [f.name for f in data_dir.glob("*.csv")]
-    
+    all_files = [f for f in data_dir.rglob("*.csv") if not f.name.startswith(".")]
+
     parsed = []
-    for f in files:
-        info = get_session_info(f)
+    for f in all_files:
+        info = get_session_info(f.name)
         if info:
+            info['path'] = f  # store full path
             parsed.append(info)
-            
-    fp_files = [x for x in parsed if 'FP' in x['type']]
-    behav_files = [x for x in parsed if 'Behav' in x['type']]
-    
+
+    fp_files    = [x for x in parsed if x['type'] == 'FP']
+    behav_files = [x for x in parsed if x['type'] == 'Behav']
+
     sessions = []
-    
+
     for fp in fp_files:
-        # Find behavior files for same mouse
         candidates = [b for b in behav_files if b['mouse'] == fp['mouse']]
-        
+
         best_match = None
         min_diff = float('inf')
-        
+
         for b in candidates:
             diff = abs((fp['datetime'] - b['datetime']).total_seconds())
             if diff < 300 and diff < min_diff:
                 min_diff = diff
                 best_match = b
-        
+
         if best_match:
             sessions.append({
-                'mouse': fp['mouse'],
-                'date': fp['datetime'].strftime('%Y-%m-%d'),
-                'time': fp['datetime'].strftime('%H:%M:%S'),
-                'FP_file': fp['filename'],
-                'Behav_file': best_match['filename'],
+                'mouse':      fp['mouse'],
+                'date':       fp['datetime'].strftime('%Y-%m-%d'),
+                'time':       fp['datetime'].strftime('%H:%M:%S'),
+                'FP_file':    str(fp['path']),
+                'Behav_file': str(best_match['path']),
                 'session_id': f"{fp['mouse']}_{fp['datetime'].strftime('%Y%m%d_%H%M%S')}"
             })
         else:
-            print(f"Unmatched FP session: {fp['filename']}")
+            unmatched_id = f"{fp['mouse']}_{fp['datetime'].strftime('%Y%m%d_%H%M%S')}"
+            update_session_log(unmatched_id, {
+                "session_id":      unmatched_id,
+                "mouse":           fp["mouse"],
+                "date":            fp["datetime"].strftime("%Y-%m-%d"),
+                "FP_file":         str(fp["path"]),
+                "Behav_file":      float("nan"),
+                "fp_behav_matched": False,
+            })
+            print(f"Unmatched FP session (no Behav within 300s): {fp['path'].name}")
 
     df = pd.DataFrame(sessions)
     if not df.empty:
         df.sort_values(['date', 'time'], inplace=True)
         df.reset_index(drop=True, inplace=True)
-        # Save matched list for reference
-        df.to_csv(PHOTOMETRY_DIR / "matched_sessions.csv", index=False)
-        
+
     return df
 
 def get_channel_config(channel_name):
@@ -350,7 +518,7 @@ def make_longform_channel_df(session_info, res):
     return df
 
 
-# --- 3. Core Processing ---
+# --- 4. Core Processing ---
 
 def process_roi(fp_df, channel_name, post_lowpass_hz=None, min_len=50,
                bleach_method="exp2", iso_smooth_cutoff=0.01):
@@ -412,7 +580,7 @@ def process_roi(fp_df, channel_name, post_lowpass_hz=None, min_len=50,
             bleach_iso = processor.fit_bleaching_from_iso(
                 ts_iso, iso, method=bleach_method, smooth_cutoff_hz=iso_smooth_cutoff
             )
-            scaled_bleach, normalized, dff = processor.correct_signal(sig, bleach_iso)
+            scaled_bleach, _, dff = processor.correct_signal(sig, bleach_iso)
         except Exception as e:
             print(f"  [{channel_name}] Iso fit failed ({e}), falling back to self-bleach.")
             use_iso = False
@@ -430,8 +598,7 @@ def process_roi(fp_df, channel_name, post_lowpass_hz=None, min_len=50,
 
         scaled_bleach = np.maximum(scaled_bleach, 1e-12)
 
-        normalized = sig / scaled_bleach
-        dff = normalized - 1.0
+        dff = sig / scaled_bleach - 1.0
 
     # Baseline sanity (after either path)
     if (not np.all(np.isfinite(scaled_bleach))) or (np.median(scaled_bleach) <= 0):
@@ -454,27 +621,31 @@ def process_roi(fp_df, channel_name, post_lowpass_hz=None, min_len=50,
     else:
         dff_zscored = np.zeros_like(dff_filtered)
 
+    fs_out = processor.compute_fs(ts_sig)
+    qc_metrics = compute_correction_metrics(
+        sig, iso, scaled_bleach, dff, dff_zscored, ts_sig, fs_out, note, channel_name
+    )
+
     return {
         "channel": channel_name,
         "note": note,
-        "ts_iso": ts_iso,
         "ts_sig": ts_sig,
         "iso": iso,
         "sig": sig,
         "scaled_bleach": scaled_bleach,
-        "normalized": normalized,
         "dff": dff,
         "dff_filtered": dff_filtered,
         "dff_zscored": dff_zscored,
-        "fs": processor.compute_fs(ts_sig)
+        "fs": fs_out,
+        "qc_metrics": qc_metrics,
+        "channel_type": "green" if channel_name.startswith("G") else "red",
     }
 
-def process_session(session_info, input_dir, output_dir, regenerate=False):
+def process_session(session_info, output_dir, regenerate=False):
     """
     Loads data for a session and processes all ROI channels.
     If regenerate=False, skips processing if output already exists.
     """
-    input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
     session_outdir = output_dir / session_info['session_id']
@@ -485,11 +656,11 @@ def process_session(session_info, input_dir, output_dir, regenerate=False):
 
     session_outdir.mkdir(parents=True, exist_ok=True)
 
-    fp_path = input_dir / session_info['FP_file']
-    behav_path = input_dir / session_info['Behav_file']
-    
-    fp = pd.read_csv(fp_path)     
-    fp = fp[fp["LedState"] != 7].copy() # 7 is often 'unknown' or 'inter-trial'
+    fp_path    = Path(session_info['FP_file'])
+    behav_path = Path(session_info['Behav_file'])
+
+    fp = pd.read_csv(fp_path)
+    fp = fp[fp["LedState"] != 7].copy()  # 7 is often 'unknown' or 'inter-trial'
 
     # Temporal Alignment with Behavior (Crop Start/End)
     try:
@@ -497,16 +668,21 @@ def process_session(session_info, input_dir, output_dir, regenerate=False):
         if "SystemTimestamp" in trigger.columns:
             sys_ts = trigger["SystemTimestamp"]
         else:
-             sys_ts = trigger.iloc[:, 3]
-             
+            sys_ts = trigger.iloc[:, 3]
+
         t_start, t_end = sys_ts.iloc[0], sys_ts.iloc[-1]
         if fp["SystemTimestamp"].min() > t_end or fp["SystemTimestamp"].max() < t_start:
             print("Warning: behavior timestamps do not overlap FP timestamps; skipping crop.")
+            fp["SystemTimestamp"] -= fp["SystemTimestamp"].min()
         else:
             fp = fp[fp["SystemTimestamp"].between(t_start, t_end)]
             fp["SystemTimestamp"] -= t_start
     except Exception as e:
-        print(f"Warning: Could not crop to behavior ({e}). Using full FP file.")
+        print(f"Warning: Could not crop to behavior ({e}). Zero-offsetting full FP file.")
+        fp["SystemTimestamp"] -= fp["SystemTimestamp"].min()
+
+    # Session duration (in minutes) from the cropped/zero-offset FP trace
+    duration_min = float(fp["SystemTimestamp"].max()) / 60.0
 
     # Identify Channels (R0, R1, G2, etc.)
     channels = [c for c in fp.columns if re.match(r'^[RG]\d+$', c)]
@@ -528,6 +704,31 @@ def process_session(session_info, input_dir, output_dir, regenerate=False):
             print("Raw QC gate failed; aborting session. See raw QC issues file.")
             return
 
+    # --- Rename hardware channel indices to biological labels ---
+    # Capture hardware channel names before relabeling for the session log
+    channels_found_raw = [r["channel"] for r in session_results]
+
+    try:
+        photometry_log = load_photometry_log()
+        label_map = get_channels_for_session(session_info["mouse"], session_info["date"], photometry_log)
+    except Exception as e:
+        print(f"  Warning: could not load photometry log for label mapping ({e}). Using hardware channel names.")
+        label_map = {}
+
+    for res in session_results:
+        res["channel_raw"] = res["channel"]  # preserve hardware name
+        res["channel"] = label_map.get(res["channel"], res["channel"])
+        # Recompute tier now that we have the bio label (indicator type depends on it)
+        tier, reasons = compute_quality_tier(
+            res["qc_metrics"], res["note"], res["channel"], fs=res["fs"], dff=res["dff"]
+        )
+        res["qc_metrics"]["quality_tier"] = tier
+        res["qc_metrics"]["tier_reasons"] = "|".join(reasons) if reasons else ""
+
+    # Drop channels that have no bio label (still named G2, R0, etc.) — unmapped hardware
+    # channels have no meaningful signal, so there's nothing to analyse or QC.
+    session_results = [r for r in session_results if not re.match(r'^[RG]\d+$', r["channel"])]
+
     # --- Save outputs (long-form + per-channel) ---
     if session_results:
         # Long-form combined
@@ -537,28 +738,55 @@ def process_session(session_info, input_dir, output_dir, regenerate=False):
 
         # Per-channel files + summary
         summary_rows = []
-        for r in session_results:
+        qc_rows = []
+        for r, df_ch in zip(session_results, long_dfs):
             ch = r["channel"]
-            df_ch = make_longform_channel_df(session_info, r)
             df_ch.to_csv(session_outdir / f"{ch}.csv", index=False)
+            plot_channel_qc(r, qc_dir, session_info["session_id"])
             summary_rows.append({
                 "channel": ch,
                 "note": r.get("note", ""),
                 "fs_hz": r.get("fs", np.nan),
                 "n_samples": len(r.get("sig", [])),
+                "duration_min": duration_min,
+            })
+            qc = r.get("qc_metrics", {})
+            qc_rows.append({
+                "session_id": session_info["session_id"],
+                "mouse": session_info["mouse"],
+                "date": session_info["date"],
+                "channel": ch,
+                "note": r.get("note", ""),
+                "duration_min": duration_min,
+                **qc,
             })
 
         pd.DataFrame(summary_rows).to_csv(session_outdir / "channel_summary.csv", index=False)
+
+        qc_df = pd.DataFrame(qc_rows)
+        qc_df.to_csv(session_outdir / "correction_quality.csv", index=False)
+
         print(f"Saved session outputs to: {session_outdir}")
 
-        # Standard QC plots (baseline/dff, etc.)
-        plot_qc_session(session_results, qc_dir, tag)
+    # --- Write to comprehensive pipeline session log ---
+    bio_labels_str = ",".join(sorted([r["channel"] for r in session_results]))
+    channels_found_str = ",".join(sorted(channels_found_raw))
+    update_session_log(session_info["session_id"], {
+        "session_id":             session_info["session_id"],
+        "mouse":                  session_info["mouse"],
+        "date":                   session_info["date"],
+        "FP_file":                session_info["FP_file"],
+        "Behav_file":             session_info.get("Behav_file", float("nan")),
+        "fp_behav_matched":       True,
+        "duration_min":           duration_min,
+        "channels_found":         channels_found_str,
+        "photometry_log_matched": bool(label_map),
+        "bio_labels":             bio_labels_str,
+    })
 
-
-# --- 4. Plotting ---
 
 def qc_gate_raw_deinterleaved(fp_df, channels, outdir, tag):
-    """Plot raw deinterleaved traces and run basic sanity checks.
+    """Run basic sanity checks on raw deinterleaved traces (sample counts, timestamp monotonicity).
 
     Returns (ok: bool, issues: list[str]).
     """
@@ -566,7 +794,6 @@ def qc_gate_raw_deinterleaved(fp_df, channels, outdir, tag):
     outdir.mkdir(parents=True, exist_ok=True)
 
     issues = []
-    # Quick checks + plots
     for ch in channels:
         try:
             iso_state, sig_state, note = get_channel_config(ch)
@@ -590,29 +817,6 @@ def qc_gate_raw_deinterleaved(fp_df, channels, outdir, tag):
             if len(ts_iso) > 2 and np.any(np.diff(ts_iso) <= 0):
                 issues.append(f"{ch}: non-monotonic iso timestamps")
 
-        # Plot (downsample)
-        max_points = 150000
-        def _ds(ts, x):
-            if len(x) == 0:
-                return np.array([]), np.array([])
-            step = max(1, len(x) // max_points)
-            t = ts[::step] - ts[0]
-            return t, x[::step]
-
-        t_sig, sig_ds = _ds(ts_sig, sig)
-        t_iso, iso_ds = _ds(ts_iso, iso)
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        if len(sig_ds):
-            ax.plot(t_sig, sig_ds, label=f"sig state {sig_state}", alpha=0.8)
-        if len(iso_ds):
-            ax.plot(t_iso, iso_ds, label=f"iso state {iso_state}", alpha=0.8)
-        ax.set_title(f"{tag} {ch} - Raw deinterleaved")
-        ax.set_xlabel("time (s, relative)")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(outdir / f"{tag}_{ch}_raw_deinterleaved.png", dpi=150)
-        plt.close(fig)
 
     ok = len(issues) == 0
     # Save issues log
@@ -621,107 +825,117 @@ def qc_gate_raw_deinterleaved(fp_df, channels, outdir, tag):
 
     return ok, issues
 
-def plot_qc_session(roi_results, outdir, tag):
-    """Generates QC plots for all processed ROIs in a session."""
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Individual ROI Plots
-    for res in roi_results:
-        plot_single_roi(res, outdir, tag)
-        
-    # 2. Multi-Green Summary (if applicable)
-    greens = [r for r in roi_results if r['channel'].startswith('G')]
-    if len(greens) > 1:
-        plot_multi_green(greens, outdir, tag)
 
-def plot_single_roi(data, outdir, tag, max_points=150000):
-    ch = data["channel"]
-    
-    # Downsample for big plots
-    n = len(data["sig"])
+def plot_channel_qc(res, outdir, session_id, max_points=150000):
+    """Save a 4-panel QC plot for one channel alongside its CSV in the session output dir."""
+    ch  = res["channel"]
+    qc  = res.get("qc_metrics", {})
+    tier        = qc.get("quality_tier", "?")
+    tier_reasons = qc.get("tier_reasons", "") or ""
+    tier_color  = {"A": "#27ae60", "B": "#e67e22", "C": "#e74c3c"}.get(tier, "#888888")
+
+    n    = len(res["sig"])
     step = max(1, n // max_points)
-    
-    t = (data["ts_sig"][::step] - data["ts_sig"][0])
-    iso = data.get("iso", np.array([]))[::step]
-    sig = data["sig"][::step]
-    base = data["scaled_bleach"][::step]
-    dff_zscored = data["dff_zscored"][::step]
+    t       = res["ts_sig"][::step] - res["ts_sig"][0]
+    sig     = res["sig"][::step]
+    base    = res["scaled_bleach"][::step]
+    dff_z   = res["dff_zscored"][::step]
+    iso_raw = res.get("iso", np.array([]))
+    iso     = iso_raw[::step] if len(iso_raw) == n else np.array([])
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 12), constrained_layout=True)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 13), constrained_layout=True)
 
-    # Raw deinterleaved reference trace (iso for green; signal for red-only)
-    if iso is not None and len(iso) == len(sig) and len(iso) > 0:
-        axes[0].plot(t, iso, color='violet')
-        axes[0].set_title(f"{tag} {ch} - Raw Isosbestic (415nm)")
+    tier_label = f"Tier {tier}" + (f"  |  {tier_reasons}" if tier_reasons else "")
+    fig.suptitle(
+        f"{session_id}  |  {ch}  |  {tier_label}",
+        fontsize=12, fontweight="bold", color=tier_color,
+        bbox=dict(facecolor="white", edgecolor=tier_color, linewidth=2, boxstyle="round,pad=0.4"),
+    )
+
+    if len(iso) == len(sig) and len(iso) > 0:
+        axes[0].plot(t, iso, color="violet")
+        axes[0].set_title(f"{ch} - Raw Isosbestic (415 nm)")
     else:
-        axes[0].plot(t, sig, color='black', alpha=0.7)
-        axes[0].set_title(f"{tag} {ch} - Raw Signal (no iso)")
-    
-    # Raw Signal + Fit
-    axes[1].plot(t, sig, label="Raw Signal", color='green' if 'G' in ch else 'red', alpha=0.8)
-    axes[1].plot(t, base, label="Scaled Iso/Baseline", color='black', linestyle='--')
-    axes[1].set_title(f"{tag} {ch} - Signal vs Baseline")
-    axes[1].legend()
-    
-    # dF/F Z-scored
-    axes[2].plot(t, dff_zscored, color='blue', lw=1)
-    axes[2].set_title(f"{tag} {ch} - dF/F Z-scored")
+        axes[0].plot(t, sig, color="black", alpha=0.7)
+        axes[0].set_title(f"{ch} - Raw Signal (no iso)")
+
+    axes[1].plot(t, sig,  label="Raw Signal",      color=get_channel_color(ch), alpha=0.8)
+    axes[1].plot(t, base, label="Scaled Baseline", color="black", linestyle="--")
+    axes[1].set_title(f"{ch} - Signal vs Baseline")
+    axes[1].legend(fontsize=8)
+
+    axes[2].plot(t, dff_z, color="steelblue", lw=1)
+    axes[2].set_title(f"{ch} - dF/F Z-scored")
     axes[2].set_ylabel("Z-score")
-    axes[2].axhline(0, color='gray', linestyle='--', alpha=0.5)
-    
-    # Histogram of z-scored data
-    axes[3].hist(data["dff_zscored"], bins=100, color='gray', alpha=0.7)
-    axes[3].set_title(f"{tag} {ch} - dF/F Z-scored Distribution")
-    
-    fig.savefig(outdir / f"{tag}_{ch}_qc.png", dpi=150)
-    plt.close(fig)
+    axes[2].axhline(0, color="gray", linestyle="--", alpha=0.5)
+    if qc:
+        metrics_str = (
+            f"R²={qc.get('r2_baseline', float('nan')):.2f}   "
+            f"drift_z={qc.get('drift_delta_z', float('nan')):.2f}   "
+            f"r_iso_dff={qc.get('r_iso_dff', float('nan')):.3f}   "
+            f"skew={qc.get('skewness', float('nan')):.2f}   "
+            f"outlier_frac={qc.get('outlier_frac', float('nan')):.4f}"
+        )
+        axes[2].text(
+            0.01, 0.97, metrics_str,
+            transform=axes[2].transAxes, fontsize=7.5, va="top", ha="left",
+            bbox=dict(facecolor="lightyellow", alpha=0.85, boxstyle="round,pad=0.3"),
+        )
 
-def plot_multi_green(greens, outdir, tag):
-    """Stacked traces for green channels to check correlation."""
-    # Align lengths
-    n = min(len(g["dff"]) for g in greens)
-    dffs = np.vstack([g["dff"][:n] for g in greens])
-    labels = [g["channel"] for g in greens]
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, (trace, label) in enumerate(zip(dffs, labels)):
-        ax.plot(trace + i*0.5, label=label)
-        
-    ax.set_title(f"{tag} - Green Channels Stacked")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(outdir / f"{tag}_multi_green.png", dpi=150)
-    plt.close(fig)
+    axes[3].hist(res["dff_zscored"], bins=100, color="gray", alpha=0.7)
+    axes[3].set_title(f"{ch} - dF/F Z-scored Distribution")
+    axes[3].set_xlabel("Z-score")
+    axes[3].set_ylabel("Count")
 
+    fig.savefig(Path(outdir) / f"{ch}_qc.png", dpi=150)
+    plt.close(fig)
 
 # --- 5. Main Execution ---
 
 def main():
     print("Starting FP Processing...")
-    
-    # 1. Flatten Data Structure
-    flatten_directory(FP_DIR, FP_DIR_FLATTENED)
-    
-    # 2. Match Sessions
-    sessions_df = match_sessions(FP_DIR_FLATTENED)
-    
+
+    PROCESSED_OUT.mkdir(parents=True, exist_ok=True)
+
+    # 1. Match FP sessions with their Behav files
+    sessions_df = match_sessions(FP_DIR)
+
     if sessions_df.empty:
-        print("No matched sessions found. Exiting.")
+        print("No matched FP+Behav sessions found. Exiting.")
         return
-        
-    print(f"Found {len(sessions_df)} matched sessions.")
-    
-    # 3. Process Loops
+
+    print(f"Found {len(sessions_df)} sessions to process.")
+
+    # 2. Process sessions
     for idx, session in sessions_df.iterrows():
         print(f"Processing {idx+1}/{len(sessions_df)}: {session['session_id']}")
-        process_session(session, FP_DIR_FLATTENED, OUT_DIR, regenerate=REGENERATE)
-        
+        process_session(session, PROCESSED_OUT, regenerate=REGENERATE)
+
     print("All done.")
+
+    # 3. Aggregate correction quality across all sessions
+    aggregate_correction_quality(PROCESSED_OUT)
+
+
+def aggregate_correction_quality(output_dir):
+    """
+    Collect per-session correction_quality.csv files into a single summary table.
+    Writes all_sessions_correction_quality.csv to output_dir root and prints flagged channels.
+    """
+    output_dir = Path(output_dir)
+    qc_files = sorted(output_dir.glob("*/correction_quality.csv"))
+
+    if not qc_files:
+        print("No correction_quality.csv files found; skipping aggregation.")
+        return
+
+    all_dfs = [pd.read_csv(f) for f in qc_files]
+    combined = pd.concat(all_dfs, ignore_index=True)
+    out_path = output_dir / "all_sessions_correction_quality.csv"
+    combined.to_csv(out_path, index=False)
+    print(f"\nCorrection quality summary: {len(combined)} channels across {len(qc_files)} sessions → {out_path}")
+
 
 if __name__ == "__main__":
     main()
-    
-    
-    
-    
+

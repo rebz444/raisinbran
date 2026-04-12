@@ -2,6 +2,7 @@
 
 import os
 import shutil
+from pathlib import Path
 
 import pandas as pd
 
@@ -26,6 +27,12 @@ def main():
     photometry_log['date'] = pd.to_datetime(photometry_log['date']).dt.strftime('%Y-%m-%d')
     sessions_training['date'] = pd.to_datetime(sessions_training['date']).dt.strftime('%Y-%m-%d')
 
+    # Deduplicate photometry log before merging to avoid row multiplication
+    dupes = photometry_log[['date', 'mouse']].duplicated().sum()
+    if dupes:
+        print(f"Note: dropping {dupes} duplicate row(s) from photometry log before merge.")
+        photometry_log = photometry_log.drop_duplicates(subset=['date', 'mouse'])
+
     # Find sessions that have both training and photometry data
     sessions_photometry = pd.merge(
         sessions_training,
@@ -33,6 +40,7 @@ def main():
         on=['date', 'mouse'],
         how='inner'
     )
+    os.makedirs(PHOTOMETRY_FOLDER, exist_ok=True)
     sessions_photometry.to_csv(os.path.join(PHOTOMETRY_FOLDER, f'sessions_photometry_{EXP}.csv'))
 
     # Report photometry sessions with no matching behavior data
@@ -49,9 +57,6 @@ def main():
             print(f"  {row['mouse']}  {row['date']}")
     else:
         print("All photometry sessions have matching behavior data.")
-
-    # Create destination folder
-    os.makedirs(PHOTOMETRY_FOLDER, exist_ok=True)
 
     # Copy directories
     copied_count = 0
@@ -72,6 +77,30 @@ def main():
         print(f"Copied: {os.path.basename(src_dir)}")
 
     print(f"\nCompleted: Copied {copied_count} of {len(sessions_photometry)} directories.")
+
+    # Dataset overview
+    mice = sessions_photometry["mouse"].unique()
+    print(f"\n{'='*50}")
+    print(f"Dataset Summary")
+    print(f"{'='*50}")
+    print(f"  Mice: {len(mice)}")
+    print(f"  Total sessions: {len(sessions_photometry)}")
+    print()
+    for mouse in sorted(mice):
+        mouse_sessions = sessions_photometry[sessions_photometry["mouse"] == mouse]
+        print(f"  {mouse}: {len(mouse_sessions)} session(s)")
+        for _, row in mouse_sessions.iterrows():
+            session_dir = Path(data_folder) / row["dir"]
+            trial_files = list(session_dir.glob("trials_analyzed_*.csv"))
+            if trial_files:
+                try:
+                    n_trials = len(pd.read_csv(trial_files[0]))
+                except Exception:
+                    n_trials = "?"
+            else:
+                n_trials = "?"
+            print(f"    {row['date']}  —  {n_trials} trials")
+    print(f"{'='*50}")
 
 
 if __name__ == '__main__':

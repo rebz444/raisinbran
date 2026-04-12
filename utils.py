@@ -8,13 +8,66 @@ import pandas as pd
 
 from config import (
     BEHAV_DIR,
-    BEHAV_LOG_CSV,
     FIBER_CHANNEL_MAP,
-    MATCHED_SESSIONS_CSV,
-    MERGED_SESSIONS_CSV,
     PHOTO_ROOT,
     PHOTOMETRY_LOG_URL,
+    PIPELINE_SESSION_LOG,
 )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline session log
+# ---------------------------------------------------------------------------
+
+def update_session_log(session_id: str, updates: dict) -> None:
+    """Read pipeline_session_log.csv, update/insert a row for session_id, write back.
+
+    Columns are added on first use; existing columns are preserved unchanged.
+    """
+    if PIPELINE_SESSION_LOG.exists():
+        log = pd.read_csv(PIPELINE_SESSION_LOG, index_col=0)
+    else:
+        log = pd.DataFrame()
+
+    for col, val in updates.items():
+        log.loc[session_id, col] = val
+
+    log.to_csv(PIPELINE_SESSION_LOG)
+
+
+# ---------------------------------------------------------------------------
+# Group assignment
+# ---------------------------------------------------------------------------
+
+def get_session_groups(bg_length_threshold: float = 2.0) -> Dict[str, str]:
+    """
+    Return {mouse: group} where group is 'long' or 'short', loaded from
+    pipeline_session_log.csv.
+
+    Uses a 'group' column directly if present; otherwise derives from the
+    median bg_length per mouse using bg_length_threshold as the split point.
+    """
+    if not PIPELINE_SESSION_LOG.exists():
+        raise FileNotFoundError(f"Pipeline session log not found: {PIPELINE_SESSION_LOG}")
+    log = pd.read_csv(PIPELINE_SESSION_LOG, index_col=0)
+
+    if "group" in log.columns:
+        _aliases = {"l": "long", "s": "short", "long": "long", "short": "short"}
+        return {
+            mouse: _aliases.get(str(grp), str(grp))
+            for mouse, grp in log.groupby("mouse")["group"].first().items()
+        }
+
+    if "bg_length" not in log.columns:
+        raise ValueError(
+            "pipeline_session_log.csv has neither 'group' nor 'bg_length' column; "
+            "cannot determine long/short BG assignment"
+        )
+    mouse_bg = log.groupby("mouse")["bg_length"].median()
+    return {
+        mouse: ("long" if length > bg_length_threshold else "short")
+        for mouse, length in mouse_bg.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -23,14 +76,17 @@ from config import (
 
 def load_merged_log() -> pd.DataFrame:
     """
-    Merge matched_sessions.csv with the behavior log CSV and save the result.
-    Returns the merged DataFrame.
+    Return pipeline sessions that have a matched behavior directory.
+
+    Reads pipeline_session_log.csv and filters to rows where behav_dir is set
+    (i.e. step 3a has run and found a matching behavior directory).
     """
-    data_log = pd.read_csv(MATCHED_SESSIONS_CSV)
-    behav_log = pd.read_csv(BEHAV_LOG_CSV, index_col=0)
-    merged_log = pd.merge(data_log, behav_log, on=["mouse", "date"], how="inner")
-    merged_log.to_csv(MERGED_SESSIONS_CSV)
-    return merged_log
+    if not PIPELINE_SESSION_LOG.exists():
+        return pd.DataFrame()
+    log = pd.read_csv(PIPELINE_SESSION_LOG, index_col=0)
+    if "behav_dir" not in log.columns:
+        return pd.DataFrame()
+    return log[log["behav_dir"].notna()].reset_index(drop=True)
 
 
 def load_photometry_log() -> pd.DataFrame:
@@ -73,18 +129,18 @@ def get_channels_for_session(mouse: str, date: str, photometry_log: pd.DataFrame
         side = str(row.get(f"fiber_{fiber_num}_side", "")).strip().lower()
         sensor = str(row.get(f"fiber_{fiber_num}_sensor", "")).strip()
         if area in ("str", "striatum"):
-            channel_labels[r_ch] = f"{r_ch}_{side}_{area}_{sensor}"
-            channel_labels[g_ch] = f"{g_ch}_{side}_{area}_{sensor}"
+            channel_labels[r_ch] = f"{side}_str_rCaMP"
+            channel_labels[g_ch] = f"{side}_str_{sensor}"
         elif area == "v1":
-            channel_labels[r_ch] = f"{r_ch}_{side}_{area}_{sensor}"
+            channel_labels[r_ch] = f"{side}_v1_rCaMP"
 
     return channel_labels
 
 
 def get_grab_channel(mouse: str, date: str, photometry_log: pd.DataFrame) -> Optional[str]:
     """
-    Return the green channel name (e.g. 'G4') for the striatum GRAB fiber
-    for this session, or None if not found.
+    Return the biological label for the striatum GRAB fiber green channel
+    (e.g. 'l_str_GRAB'), or None if not found.
     """
     row = photometry_log[
         (photometry_log["mouse"] == mouse) & (photometry_log["date"] == date)
@@ -100,11 +156,12 @@ def get_grab_channel(mouse: str, date: str, photometry_log: pd.DataFrame) -> Opt
     if n_fibers not in FIBER_CHANNEL_MAP:
         return None
 
-    for fiber_num, (_, g_ch) in FIBER_CHANNEL_MAP[n_fibers].items():
+    for fiber_num, (_, _g_ch) in FIBER_CHANNEL_MAP[n_fibers].items():
         area = str(row.get(f"fiber_{fiber_num}_area", "")).strip().lower()
+        side = str(row.get(f"fiber_{fiber_num}_side", "")).strip().lower()
         sensor = str(row.get(f"fiber_{fiber_num}_sensor", "")).strip()
         if area in ("str", "striatum") and "grab" in sensor.lower():
-            return g_ch
+            return f"{side}_str_{sensor}"
 
     return None
 
@@ -121,8 +178,7 @@ def assign_trials_to_photometry(phot: pd.DataFrame, trials: pd.DataFrame) -> pd.
     - phot: DataFrame with 't_sec' column (photometry timestamps)
     - trials: DataFrame with 'start_time', 'end_time', 'bg_length', 'time_waited' columns
 
-    Returns phot with added columns: session_trial_num, trial_time, decision_time,
-    plus all trial columns merged in.
+    Returns phot with added columns: trial_time, plus all trial columns merged in.
     """
     trials = trials.copy()
     session_first_start = float(trials.iloc[0]["start_time"])
@@ -142,5 +198,4 @@ def assign_trials_to_photometry(phot: pd.DataFrame, trials: pd.DataFrame) -> pd.
 
     merged = merged[merged["t_sec"] <= merged["end_time"]].reset_index(drop=True)
     merged["trial_time"] = merged["t_sec"] - merged["start_time"]
-    merged["decision_time"] = merged["bg_length"] + merged["time_waited"]
     return merged

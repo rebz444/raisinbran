@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from config import PROCESSED_OUT
+from config import NON_IMPULSIVE_CUTOFF
 
 
 def _find_file(patterns: List[str]) -> Optional[Path]:
@@ -91,6 +91,7 @@ class TrialTimes:
     cue_off: float
     decision: float  # first lick in wait / consumption start
     has_decision: bool
+    last_lick: float = float("nan")  # trial_time of last lick before wait period (may be negative if lick was in bg or a previous trial)
 
 
 def extract_trial_times(events: pd.DataFrame) -> Dict[int, TrialTimes]:
@@ -257,70 +258,107 @@ def time_resolved_correlation(
     only using trials that are still waiting at that time.
 
     We restrict to trials with decisions (not missed).
-    """
-    assert align in {"cue_on", "cue_off"}
 
-    # map trial -> wait_time label depending on align (cue_on vs cue_off)
+    align: "cue_on", "cue_off", or "last_lick".
+
+    For "cue_on"/"cue_off" the anchor is fixed within the trial, so DA is
+    sampled using trial_time within the per-trial photometry segment.
+
+    For "last_lick" the anchor is tt.last_lick — the time of the last pre-wait
+    lick, derived as decision - time_waited_since_last_lick. This can be
+    negative in trial_time (lick was in a previous trial), so DA is sampled
+    using absolute t_sec across the full session photometry instead.
+    """
+    if align not in {"cue_on", "cue_off", "last_lick"}:
+        raise ValueError(f"align must be 'cue_on', 'cue_off', or 'last_lick'; got {align!r}")
+
+    use_abs_time = (align == "last_lick")
+
     if align == "cue_on":
         wait_label = "wait_from_cue_on"
+    elif align == "last_lick":
+        wait_label = "wait_from_last_lick"
     else:
         wait_label = "wait_from_cue_off"
 
-    # precompute decision times etc
+    # For last_lick we need each trial's absolute start time in session seconds.
+    t0 = float(trials.sort_values("start_time").iloc[0]["start_time"])
+    trial_start_sec_map = {
+        int(r["session_trial_num"]): float(r["start_time"]) - t0
+        for _, r in trials.iterrows()
+    }
+
+    # Collect trials that have a valid anchor and decision.
     good_trials = []
     for tr, tt in trial_times.items():
         if not tt.has_decision or not np.isfinite(tt.decision):
             continue
-        if not np.isfinite(getattr(tt, align)):
+        anchor = tt.last_lick if use_abs_time else getattr(tt, align)
+        if not np.isfinite(anchor):
             continue
         good_trials.append(tr)
     good_trials = np.array(sorted(good_trials), dtype=int)
     if len(good_trials) < 10:
         raise ValueError("Not enough decision trials for time-resolved correlation.")
 
-    # build per-trial wait time
+    # Build per-trial timing table.
     tt_df = pd.DataFrame({
         "session_trial_num": good_trials,
-        "cue_on_t": [trial_times[int(tr)].cue_on for tr in good_trials],
-        "cue_off_t": [trial_times[int(tr)].cue_off for tr in good_trials],
-        "decision_t": [trial_times[int(tr)].decision for tr in good_trials],
+        "cue_on_t":    [trial_times[int(tr)].cue_on     for tr in good_trials],
+        "cue_off_t":   [trial_times[int(tr)].cue_off    for tr in good_trials],
+        "decision_t":  [trial_times[int(tr)].decision   for tr in good_trials],
+        "last_lick_t": [trial_times[int(tr)].last_lick  for tr in good_trials],
     })
-    tt_df["wait_from_cue_on"] = tt_df["decision_t"] - tt_df["cue_on_t"]
-    tt_df["wait_from_cue_off"] = tt_df["decision_t"] - tt_df["cue_off_t"]
+    tt_df["wait_from_cue_on"]    = tt_df["decision_t"] - tt_df["cue_on_t"]
+    tt_df["wait_from_cue_off"]   = tt_df["decision_t"] - tt_df["cue_off_t"]
+    tt_df["wait_from_last_lick"] = tt_df["decision_t"] - tt_df["last_lick_t"]
 
-    # join to ensure same trial set as trials table (for flags, etc.)
     tt_df = tt_df.merge(trials[["session_trial_num"]], on="session_trial_num", how="inner")
     if tt_df.empty:
         raise ValueError("No overlapping trials between trial_times and trials table.")
     wait = tt_df.set_index("session_trial_num")[wait_label]
 
-    # pre-index phot by trial
-    phot_g = phot[phot["session_trial_num"].isin(tt_df["session_trial_num"])].copy()
+    if use_abs_time:
+        # Pre-extract arrays for fast nearest-neighbour lookup across full session.
+        phot_tsec   = phot["t_sec"].to_numpy(dtype=float)
+        phot_signal = phot[signal_col].to_numpy(dtype=float)
+    else:
+        phot_g = phot[phot["session_trial_num"].isin(tt_df["session_trial_num"])].copy()
 
     rows = []
     n_trials_total = len(tt_df)
     for t in t_grid:
-        # trials still waiting at this relative time:
-        # condition: t <= (decision - buffer) - align_time
-        # i.e. decision_t - buffer >= align_t + t
         still_waiting = []
         da_vals = []
         wt_vals = []
         for tr in tt_df["session_trial_num"].to_numpy(dtype=int):
             tt = trial_times[int(tr)]
-            align_t = getattr(tt, align)
-            if not np.isfinite(align_t) or not np.isfinite(tt.decision):
+            if not np.isfinite(tt.decision):
                 continue
-            if tt.decision - pre_decision_buffer < align_t + t:
-                continue
-            # sample DA at that trial_time (align_t + t)
-            target = align_t + t
-            seg = phot_g[(phot_g["session_trial_num"] == tr)]
-            if seg.empty:
-                continue
-            # nearest neighbor sample
-            idx = np.argmin(np.abs(seg["trial_time"].to_numpy() - target))
-            da = float(seg.iloc[idx][signal_col])
+
+            if use_abs_time:
+                tss = trial_start_sec_map.get(tr, np.nan)
+                if not np.isfinite(tss) or not np.isfinite(tt.last_lick):
+                    continue
+                anchor_abs   = tss + tt.last_lick
+                decision_abs = tss + tt.decision
+                if decision_abs - pre_decision_buffer < anchor_abs + t:
+                    continue
+                target_abs = anchor_abs + t
+                idx = np.argmin(np.abs(phot_tsec - target_abs))
+                da = float(phot_signal[idx])
+            else:
+                align_t = getattr(tt, align)
+                if not np.isfinite(align_t):
+                    continue
+                if tt.decision - pre_decision_buffer < align_t + t:
+                    continue
+                seg = phot_g[phot_g["session_trial_num"] == tr]
+                if seg.empty:
+                    continue
+                idx = np.argmin(np.abs(seg["trial_time"].to_numpy() - (align_t + t)))
+                da = float(seg.iloc[idx][signal_col])
+
             if not np.isfinite(da):
                 continue
             da_vals.append(da)
@@ -334,31 +372,10 @@ def time_resolved_correlation(
 
         da_vals = np.asarray(da_vals)
         wt_vals = np.asarray(wt_vals)
-        # Pearson r
         r = np.corrcoef(da_vals, wt_vals)[0, 1] if np.nanstd(da_vals) > 0 and np.nanstd(wt_vals) > 0 else np.nan
         rows.append({"t": t, "r": float(r), "n": len(da_vals), "frac_waiting": float(frac)})
 
     return pd.DataFrame(rows)
-
-
-# ----------------------------
-# Negative controls
-# ----------------------------
-
-def permutation_null(effect_fn, n_perm: int, rng: np.random.Generator) -> np.ndarray:
-    """Compute null distribution by permuting labels inside effect_fn."""
-    vals = []
-    for _ in range(n_perm):
-        vals.append(effect_fn(shuffle="perm"))
-    return np.asarray(vals, dtype=float)
-
-
-def circular_shift_null(effect_fn, n_perm: int, rng: np.random.Generator) -> np.ndarray:
-    """Null distribution by circularly shifting labels (preserves slow drifts)."""
-    vals = []
-    for _ in range(n_perm):
-        vals.append(effect_fn(shuffle="cshift"))
-    return np.asarray(vals, dtype=float)
 
 
 # ----------------------------
@@ -385,7 +402,7 @@ class AnalysisConfig:
     outdir: Path = Path("wait_analysis_out")
     signal_col: str = "dff_zscored"
     iso_col: str = "iso"
-    impulsive_sec: float = 0.25
+    impulsive_sec: float = NON_IMPULSIVE_CUTOFF  # matches config.py NON_IMPULSIVE_CUTOFF
     pre_decision_buffer: float = 0.2
     t_min_after_align: float = 0.3
     n_perm: int = 1000
@@ -437,6 +454,9 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     rows = []
     windows = [(-2.0, -1.5), (-1.5, -1.0), (-1.0, -0.5), (-0.5, -0.2)]
 
+    # t0 converts trial start_time (epoch) to session-seconds, matching phot_t["t_sec"]
+    t0 = float(trials.iloc[0]["start_time"])
+
     for tr in sorted(trials["session_trial_num"].astype(int).unique()):
         tr_row = trials.loc[trials["session_trial_num"].astype(int) == tr].iloc[0].to_dict()
         tt = trial_times.get(int(tr), None)
@@ -445,15 +465,31 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
 
         phot_trial = phot_t[phot_t["session_trial_num"] == int(tr)]
 
+        # `last_lick` in trials_analyzed is the last CONSUMPTION lick (~2s after decision)
+        # — not what we want. `time_waited_since_last_lick` is the duration from the last
+        # pre-wait lick to the decision, so we derive the anchor as decision - duration.
+        # The result is in trial_time and is negative when the last lick was in a previous trial.
+        trial_start_sec = float(tr_row["start_time"]) - t0
+        twll = tr_row.get("time_waited_since_last_lick", np.nan)
+        twll = float(twll) if pd.notna(twll) and np.isfinite(float(twll)) else float("nan")
+        tt.last_lick = (tt.decision - twll) if (tt.has_decision and np.isfinite(twll)) else float("nan")
+
         # Compute wait labels
         tr_row["cue_on_t"] = tt.cue_on
         tr_row["cue_off_t"] = tt.cue_off
         tr_row["decision_t"] = tt.decision
         tr_row["has_decision"] = tt.has_decision
+        tr_row["last_lick_t"] = tt.last_lick
         tr_row["wait_from_cue_on"] = (tt.decision - tt.cue_on) if tt.has_decision else np.nan
         tr_row["wait_from_cue_off"] = (tt.decision - tt.cue_off) if tt.has_decision else np.nan
+        tr_row["wait_from_last_lick"] = twll  # = decision - last_pre_wait_lick (trial_time)
 
-        # Slopes (cue on and cue off), signal and iso
+        # Sanity check: last_lick -> decision must be >= 0.3s by task design
+        wll = tr_row["wait_from_last_lick"]
+        if np.isfinite(wll) and wll < 0.3:
+            print(f"[WARN] Trial {tr}: wait_from_last_lick={wll:.3f}s < 0.3s — check task data")
+
+        # Slopes for cue-anchored alignments (these use trial_time within phot_trial)
         for align in ["cue_on", "cue_off"]:
             a, b, r2 = compute_ramp_slope_per_trial(
                 phot_trial, tt, align=align, signal_col=cfg.signal_col,
@@ -480,7 +516,6 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
                 if len(seg) >= 5:
                     t = seg["trial_time"].to_numpy()
                     y = seg[cfg.signal_col].to_numpy()
-                    # reverse time within segment
                     t_rev = (t.max() - t) + t.min()
                     a_rev, _, _ = robust_linear_slope(t_rev, y)
                 else:
@@ -488,6 +523,35 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
             else:
                 a_rev = np.nan
             tr_row[f"slope_{align}_time_reversed"] = a_rev
+
+        # Slope for last_lick anchor — uses t_sec on the full phot_t so the window
+        # spans into the previous trial when last_lick is negative (trial_time < 0).
+        # Convert last_lick and decision from trial_time to session-absolute t_sec.
+        if tt.has_decision and np.isfinite(tt.last_lick) and np.isfinite(tt.decision):
+            ll_start_abs = trial_start_sec + tt.last_lick + cfg.t_min_after_align
+            ll_end_abs   = trial_start_sec + tt.decision  - cfg.pre_decision_buffer
+            if ll_end_abs > ll_start_abs + 0.2:
+                seg_ll = phot_t[(phot_t["t_sec"] >= ll_start_abs) & (phot_t["t_sec"] <= ll_end_abs)]
+                if len(seg_ll) >= 5:
+                    t_ll = seg_ll["t_sec"].to_numpy()
+                    y_ll = seg_ll[cfg.signal_col].to_numpy()
+                    y_iso_ll = seg_ll[cfg.iso_col].to_numpy()
+                    a_ll,    _, r2_ll    = robust_linear_slope(t_ll, y_ll)
+                    a_iso_ll, _, r2_iso_ll = robust_linear_slope(t_ll, y_iso_ll)
+                    t_rev_ll = (t_ll.max() - t_ll) + t_ll.min()
+                    a_rev_ll, _, _ = robust_linear_slope(t_rev_ll, y_ll)
+                else:
+                    a_ll = a_iso_ll = r2_ll = r2_iso_ll = a_rev_ll = np.nan
+            else:
+                a_ll = a_iso_ll = r2_ll = r2_iso_ll = a_rev_ll = np.nan
+        else:
+            a_ll = a_iso_ll = r2_ll = r2_iso_ll = a_rev_ll = np.nan
+
+        tr_row["slope_last_lick"]             = a_ll
+        tr_row["slope_last_lick_r2"]          = r2_ll
+        tr_row["slope_last_lick_iso"]         = a_iso_ll
+        tr_row["slope_last_lick_iso_r2"]      = r2_iso_ll
+        tr_row["slope_last_lick_time_reversed"] = a_rev_ll
 
         # Mean DA in windows before decision (signal and iso)
         means = compute_mean_in_windows(phot_trial, tt, signal_col=cfg.signal_col, windows=windows, relative_to="decision")
@@ -505,6 +569,22 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     # ----------------------------
     rng = np.random.default_rng(cfg.seed)
 
+    def _filter_good(df: pd.DataFrame) -> pd.DataFrame:
+        """Apply the same trial filters used by file 5's filter_good_trials."""
+        m = df["has_decision"] == True
+        if "miss_trial" in df.columns:
+            m = m & (df["miss_trial"].fillna(False) == False)
+        if "bg_restart" in df.columns:
+            m = m & (df["bg_restart"].fillna(False) == False)
+        if "impulsive" in df.columns:
+            m = m & (~df["impulsive"].fillna(False).astype(bool))
+        return df[m].copy()
+
+    # Trial counts
+    good = _filter_good(metrics)
+    summary["n_trials"]      = len(metrics)
+    summary["n_good_trials"] = len(good)
+
     def effect_slope_vs_wait(align: str, use_iso: bool = False, shuffle: Optional[str] = None) -> float:
         """
         Effect summary: Pearson r between slope and wait time (decision trials only).
@@ -514,10 +594,14 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
           - "cshift": circular shift wait labels
         """
         slope_col = f"slope_{align}_iso" if use_iso else f"slope_{align}"
-        wait_col = "wait_from_cue_on" if align == "cue_on" else "wait_from_cue_off"
+        if align == "cue_on":
+            wait_col = "wait_from_cue_on"
+        elif align == "last_lick":
+            wait_col = "wait_from_last_lick"
+        else:
+            wait_col = "wait_from_cue_off"
 
-        df = metrics.copy()
-        df = df[df["has_decision"] == True]
+        df = _filter_good(metrics)
         df = df[np.isfinite(df[slope_col]) & np.isfinite(df[wait_col])]
         if len(df) < 10:
             return np.nan
@@ -539,21 +623,26 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     figdir = cfg.outdir / "figures"
     figdir.mkdir(exist_ok=True, parents=True)
 
-    for align in ["cue_off", "cue_on"]:
-        wait_col = "wait_from_cue_off" if align == "cue_off" else "wait_from_cue_on"
+    for align in ["cue_off", "cue_on", "last_lick"]:
+        if align == "cue_on":
+            wait_col = "wait_from_cue_on"
+        elif align == "last_lick":
+            wait_col = "wait_from_last_lick"
+        else:
+            wait_col = "wait_from_cue_off"
         slope_col = f"slope_{align}"
-        df = metrics[(metrics["has_decision"] == True) & np.isfinite(metrics[wait_col]) & np.isfinite(metrics[slope_col])].copy()
-
-        plt.figure(figsize=(6, 5))
-        plt.scatter(df[wait_col], df[slope_col], alpha=0.7)
-        r = np.corrcoef(df[wait_col], df[slope_col])[0, 1] if len(df) >= 2 else np.nan
-        plt.xlabel(wait_col)
-        plt.ylabel(slope_col)
-        plt.title(f"Slope vs wait ({align})  r={r:.3f}")
-        savefig(figdir / f"scatter_slope_vs_wait_{align}.png")
+        df = _filter_good(metrics)
+        df = df[np.isfinite(df[wait_col]) & np.isfinite(df[slope_col])].copy()
 
         # Negative controls: iso, shuffle, time-reversal
         r_real = effect_slope_vs_wait(align, use_iso=False, shuffle=None)
+
+        plt.figure(figsize=(6, 5))
+        plt.scatter(df[wait_col], df[slope_col], alpha=0.7)
+        plt.xlabel(wait_col)
+        plt.ylabel(slope_col)
+        plt.title(f"Slope vs wait ({align})  r={r_real:.3f}" if np.isfinite(r_real) else f"Slope vs wait ({align})")
+        savefig(figdir / f"scatter_slope_vs_wait_{align}.png")
         r_iso = effect_slope_vs_wait(align, use_iso=True, shuffle=None)
         r_rev = np.corrcoef(
             df[wait_col].to_numpy(float),
@@ -563,6 +652,21 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
         # Null distributions
         null_perm = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="perm") for _ in range(cfg.n_perm)])
         null_csh = np.asarray([effect_slope_vs_wait(align, use_iso=False, shuffle="cshift") for _ in range(cfg.n_perm)])
+
+        # Permutation p-values: fraction of null |r| >= observed |r|
+        valid_perm = null_perm[np.isfinite(null_perm)]
+        valid_csh  = null_csh[np.isfinite(null_csh)]
+        p_perm = float(np.mean(np.abs(valid_perm) >= abs(r_real))) if np.isfinite(r_real) and len(valid_perm) else np.nan
+        p_csh  = float(np.mean(np.abs(valid_csh)  >= abs(r_real))) if np.isfinite(r_real) and len(valid_csh)  else np.nan
+
+        summary[f"n_{align}"]          = len(df)
+        summary[f"mean_wait_{align}"]  = float(df[wait_col].mean()) if len(df) else np.nan
+        summary[f"mean_slope_{align}"] = float(df[slope_col].mean()) if len(df) else np.nan
+        summary[f"r_{align}"]          = r_real
+        summary[f"r_iso_{align}"]      = r_iso
+        summary[f"r_time_rev_{align}"] = r_rev
+        summary[f"p_perm_{align}"]     = p_perm
+        summary[f"p_csh_{align}"]      = p_csh
 
         plt.figure(figsize=(7, 4))
         plt.hist(null_perm[np.isfinite(null_perm)], bins=40, alpha=0.6, label="perm null")
@@ -580,9 +684,15 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     # ----------------------------
     # Option B: pre-decision window means (heatmap-ish summary)
     # ----------------------------
-    for align in ["cue_off", "cue_on"]:
-        wait_col = "wait_from_cue_off" if align == "cue_off" else "wait_from_cue_on"
-        df = metrics[(metrics["has_decision"] == True) & np.isfinite(metrics[wait_col])].copy()
+    for align in ["cue_off", "cue_on", "last_lick"]:
+        if align == "cue_on":
+            wait_col = "wait_from_cue_on"
+        elif align == "last_lick":
+            wait_col = "wait_from_last_lick"
+        else:
+            wait_col = "wait_from_cue_off"
+        df = _filter_good(metrics)
+        df = df[np.isfinite(df[wait_col])].copy()
         if df.empty:
             continue
 
@@ -609,7 +719,7 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     # Option C: time-resolved correlation
     # ----------------------------
     t_grid = np.arange(0.0, 6.0, 0.1)  # seconds after align
-    for align in ["cue_off", "cue_on"]:
+    for align in ["cue_off", "cue_on", "last_lick"]:
         try:
             trcorr = time_resolved_correlation(
                 phot=phot_t,
@@ -639,7 +749,6 @@ def run_session(cfg: "AnalysisConfig", session_label: str = "") -> dict:
     return summary
 
 
-
 if __name__ == "__main__":
     # ----------------------------------------------------------------
     # IDE RUN CONFIG — edit these instead of using the terminal
@@ -655,7 +764,7 @@ if __name__ == "__main__":
     # Analysis settings
     SIGNAL_COL          = "dff_zscored"
     ISO_COL             = "iso"
-    IMPULSIVE_SEC       = 0.25
+    IMPULSIVE_SEC       = NON_IMPULSIVE_CUTOFF  # from config.py
     PRE_DECISION_BUFFER = 0.2
     T_MIN_AFTER_ALIGN   = 0.3
     N_PERM              = 1000
@@ -673,7 +782,7 @@ if __name__ == "__main__":
 
         for _, session_info in merged_log.iterrows():
             session_id = str(session_info["session_id"])
-            behav_subdir = str(session_info["dir"])
+            behav_subdir = str(session_info["behav_dir"])
             mouse = str(session_info["mouse"])
             date = str(session_info["date"])
 
