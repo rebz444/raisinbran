@@ -60,9 +60,9 @@ def plot_trial(
     ax.axvline(trial_data["bg_length"], color="orange", linestyle="--", linewidth=2, alpha=0.7, label="WAIT start")
     if not trial_data["miss_trial"]:
         if trial_data["reward"] > 0:
-            ax.axvline(trial_data["decision_time"], color="blue", linestyle="--", linewidth=2, alpha=0.7, label="Decision")
+            ax.axvline(trial_data["time_waited_since_cue_on"], color="blue", linestyle="--", linewidth=2, alpha=0.7, label="Decision")
         else:
-            ax.axvline(trial_data["decision_time"], color="red", linestyle="--", linewidth=2, alpha=0.7, label="Decision")
+            ax.axvline(trial_data["time_waited_since_cue_on"], color="red", linestyle="--", linewidth=2, alpha=0.7, label="Decision")
 
     if "key" in trial_events.columns:
         lick_events = trial_events[trial_events["key"] == "lick"]

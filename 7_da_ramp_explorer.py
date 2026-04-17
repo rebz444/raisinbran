@@ -47,7 +47,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
-from config import BEHAV_DIR, DEFAULT_SIGNAL_COL, PROCESSED_OUT
+from config import BEHAV_DIR, DA_RAMP_DIR, DEFAULT_SIGNAL_COL, GROUP_COLORS, PIPELINE_SESSION_LOG, PROCESSED_OUT
 from utils import get_grab_channel, get_session_groups, load_photometry_log
 
 
@@ -60,7 +60,10 @@ class Config:
     # Paths
     PROCESSED_OUT: Path = PROCESSED_OUT
     BEHAV_DIR: Path = BEHAV_DIR
-    OUTPUT_DIR: Path = Path("/Volumes/T7 Shield/photometry/da_ramp_analysis")
+    OUTPUT_DIR: Path = DA_RAMP_DIR
+
+    # Quality filter (True = GRAB tier A/B only + no short sessions; False = all sessions)
+    QUALITY_FILTER: bool = True
 
     # Signal
     SIGNAL_COL: str = DEFAULT_SIGNAL_COL
@@ -69,6 +72,9 @@ class Config:
     POST_DECISION_SEC: float = 1.0
     BIN_SIZE_MS: int = 50
     MIN_WINDOW_SEC: float = 0.5
+    MAX_WINDOW_SEC: float = 15.0          # HARD CUTOFF: drop trials with windows > this
+    MAX_WINDOW_PERCENTILE: float = 99.0   # filter: drop trials above this percentile per anchor
+    PLOT_WINDOW_PERCENTILE: float = 95.0  # plot: x-axis extends to this percentile of windows
     SLOPE_BUFFER_START: float = 0.3
     SLOPE_BUFFER_END: float = 0.2
 
@@ -79,11 +85,7 @@ class Config:
     N_QUARTILES: int = 4
 
     # Colors
-    GROUP_COLORS: Dict[str, str] = field(default_factory=lambda: {
-        "short": "#E85D24",
-        "long":  "#2E86AB",
-        "all":   "#555555",
-    })
+    GROUP_COLORS: Dict[str, str] = field(default_factory=lambda: GROUP_COLORS)
     MOUSE_COLORS: Dict[str, str] = field(default_factory=lambda: {
         "RZ074": "#1f77b4",
         "RZ075": "#ff7f0e",
@@ -105,9 +107,49 @@ class Config:
 # =============================================================================
 
 def load_all_sessions(config: Config) -> List[Dict]:
-    """Load all sessions with photometry and behavior data."""
+    """Load all sessions with photometry and behavior data.
+
+    If config.QUALITY_FILTER is True, restricts to sessions where the GRAB
+    channel is tier A or B and the session is not short.
+    """
     group_map = get_session_groups()
     photometry_log = load_photometry_log()
+
+    if config.QUALITY_FILTER:
+        short_sessions: set = set()
+        if PIPELINE_SESSION_LOG.exists():
+            session_log = pd.read_csv(PIPELINE_SESSION_LOG, index_col=0)
+            if "short_session" in session_log.columns:
+                short_sessions = set(
+                    session_log.index[session_log["short_session"].fillna(False).astype(bool)]
+                )
+
+        allowed_sessions: set = set()
+        n_total = 0
+        for session_dir in sorted(config.PROCESSED_OUT.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            qc_file = session_dir / "correction_quality.csv"
+            if not qc_file.exists():
+                continue
+            n_total += 1
+            session_id = session_dir.name
+            if session_id in short_sessions:
+                continue
+            try:
+                qc = pd.read_csv(qc_file)
+                grab_rows = qc[qc["channel"].str.contains("GRAB", na=False)]
+                if grab_rows.empty:
+                    continue
+                if grab_rows.iloc[0]["quality_tier"] in ("A", "B"):
+                    allowed_sessions.add(session_id)
+            except Exception:
+                continue
+        print(f"  Session filter: {len(allowed_sessions)} of {n_total} sessions pass (GRAB tier A/B, not short)")
+    else:
+        allowed_sessions = None
+        print("  Session filter: disabled (using all sessions)")
+
     all_sessions = []
 
     for session_dir in sorted(config.PROCESSED_OUT.iterdir()):
@@ -115,6 +157,10 @@ def load_all_sessions(config: Config) -> List[Dict]:
             continue
 
         session_id = session_dir.name
+
+        if allowed_sessions is not None and session_id not in allowed_sessions:
+            continue
+
         parts = session_id.split("_")
         mouse = parts[0] if parts else None
 
@@ -442,6 +488,60 @@ def setup_style():
     })
 
 
+def filter_long_windows(traces_all, traces_group, traces_mouse, config):
+    """Filter trials with extremely long windows.
+
+    Two-stage filtering:
+    1. HARD CUTOFF: Remove any trial with window > MAX_WINDOW_SEC (e.g., 15s)
+    2. PERCENTILE: Per anchor, remove trials above MAX_WINDOW_PERCENTILE
+
+    Cutoffs are computed from the global pool so every dict is filtered consistently.
+    Returns updated (traces_all, traces_group, traces_mouse) and logs what was removed.
+    """
+    n_before = len(traces_all["all"])
+
+    # --- Stage 1: Hard cutoff ---
+    def _apply_hard(lst):
+        return [t for t in lst if t["window_duration"] <= config.MAX_WINDOW_SEC]
+
+    traces_all   = {"all": _apply_hard(traces_all["all"])}
+    traces_group = {g: _apply_hard(v) for g, v in traces_group.items()}
+    traces_mouse = {m: _apply_hard(v) for m, v in traces_mouse.items()}
+
+    n_after_hard = len(traces_all["all"])
+    print(f"  Hard cutoff (>{config.MAX_WINDOW_SEC:.1f}s): removed {n_before - n_after_hard} traces")
+
+    # --- Stage 2: Per-anchor percentile cutoff ---
+    anchors  = sorted(set(t.get("anchor") for t in traces_all["all"]))
+    cutoffs  = {}
+    for anchor in anchors:
+        wins = [t["window_duration"] for t in traces_all["all"] if t.get("anchor") == anchor]
+        if len(wins) < 10:
+            continue
+        cutoffs[anchor] = np.percentile(wins, config.MAX_WINDOW_PERCENTILE)
+        print(f"  [{anchor}] {config.MAX_WINDOW_PERCENTILE:.0f}th pct cutoff: "
+              f"{cutoffs[anchor]:.2f}s  (max now {max(wins):.2f}s)")
+
+    def _apply_pct(lst):
+        return [t for t in lst if t["window_duration"] <= cutoffs.get(t.get("anchor"), np.inf)]
+
+    traces_all   = {"all": _apply_pct(traces_all["all"])}
+    traces_group = {g: _apply_pct(v) for g, v in traces_group.items()}
+    traces_mouse = {m: _apply_pct(v) for m, v in traces_mouse.items()}
+
+    n_after = len(traces_all["all"])
+    print(f"  Total removed: {n_before - n_after} / {n_before} traces ({100*(n_before-n_after)/max(n_before,1):.1f}%)")
+    return traces_all, traces_group, traces_mouse
+
+
+def _plot_window_cap(traces_iter, config):
+    """Return the x-axis window extent for plots (PLOT_WINDOW_PERCENTILE of durations)."""
+    wins = [t["window_duration"] for t in traces_iter]
+    if not wins:
+        return 12.0
+    return float(np.percentile(wins, config.PLOT_WINDOW_PERCENTILE))
+
+
 def plot_average_trace(ax, traces, time_grid, color, label, direction):
     """Plot mean ± SEM trace."""
     if len(traces) < 3:
@@ -462,44 +562,71 @@ def plot_average_trace(ax, traces, time_grid, color, label, direction):
         ax.axvline(np.nanmedian(windows), color="k", linestyle="--", linewidth=1, alpha=0.5)
 
 
+def _mouse_sort_key(name, all_traces):
+    """Sort key: group first (long before short), then mouse name."""
+    traces = all_traces[name]
+    group = traces[0]["group"] if traces else "z"
+    return (group, name)
+
+
+def _mouse_group(name, all_traces):
+    """Return the group for a mouse, inferred from its traces."""
+    traces = all_traces[name]
+    return traces[0]["group"] if traces else None
+
+
 def plot_traces_grid(all_traces, config, direction, output_dir, level):
     """Grid of average traces (rows = groups/mice, cols = anchors)."""
     anchors = config.ANCHORS
-    names   = sorted(all_traces.keys())
+    if level == "mouse":
+        names = sorted(all_traces.keys(), key=lambda m: _mouse_sort_key(m, all_traces))
+    else:
+        names = sorted(all_traces.keys())
     n_rows, n_cols = len(names), len(anchors)
     if n_rows == 0:
         return
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows), squeeze=False)
 
+    all_flat  = [t for v in all_traces.values() for t in v]
+    plot_cap  = _plot_window_cap(all_flat, config)
     if direction == "forward":
-        max_window = max(
-            max((t["window_duration"] for t in traces), default=0)
-            for traces in all_traces.values() if traces
-        )
-        time_grid = np.arange(0, min(max_window + config.POST_DECISION_SEC, 15),
+        time_grid = np.arange(0, min(plot_cap + config.POST_DECISION_SEC, 15),
                               config.BIN_SIZE_MS / 1000)
     else:
-        max_window = max(
-            max((t["window_duration"] for t in traces), default=0)
-            for traces in all_traces.values() if traces
-        )
-        time_grid = np.arange(-min(max_window, 12), config.POST_DECISION_SEC,
+        time_grid = np.arange(-plot_cap, config.POST_DECISION_SEC,
                               config.BIN_SIZE_MS / 1000)
+
+    if len(time_grid) == 0:
+        plt.close(fig)
+        return
+
+    # For mouse level: track group changes to draw separators between groups
+    prev_group = None
 
     for row, name in enumerate(names):
         for col, anchor in enumerate(anchors):
             ax = axes[row, col]
             traces = [t for t in all_traces[name] if t.get("anchor") == anchor]
+
+            if level == "mouse":
+                mouse_group = _mouse_group(name, all_traces)
+                color = config.GROUP_COLORS.get(mouse_group, "#555555")
+                # Shade row background by group
+                ax.set_facecolor(config.GROUP_COLORS.get(mouse_group, "#555555") + "18")
+            elif level == "group":
+                mouse_group = None
+                color = config.GROUP_COLORS.get(name, "#555555")
+            else:
+                mouse_group = None
+                color = config.GROUP_COLORS.get("all")
+
             if len(traces) < 3:
                 ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
                         transform=ax.transAxes)
-                ax.set_title(f"{name} | {anchor}")
+                group_label = f" ({mouse_group})" if mouse_group else ""
+                ax.set_title(f"{name}{group_label} | {anchor}")
                 continue
-
-            color = (config.GROUP_COLORS.get("all") if level == "all"
-                     else config.GROUP_COLORS.get(name, "#555555") if level == "group"
-                     else config.MOUSE_COLORS.get(name, "#555555"))
 
             plot_average_trace(ax, traces, time_grid, color, name, direction)
 
@@ -512,10 +639,19 @@ def plot_traces_grid(all_traces, config, direction, output_dir, level):
                 windows.append(t["window_duration"])
 
             r, p, n = compute_correlation(np.array(slopes), np.array(windows))
-            ax.set_title(f"{name} | {anchor}\nn={n}, slope={np.nanmean(slopes):.3f}, r={r:.2f}")
+            group_label = f" ({mouse_group})" if mouse_group else ""
+            ax.set_title(f"{name}{group_label} | {anchor}\nn={n}, slope={np.nanmean(slopes):.3f}, r={r:.2f}")
             ax.set_xlabel("Time (s)" if row == n_rows - 1 else "")
             ax.set_ylabel("DA (z)" if col == 0 else "")
             ax.axhline(0, color="gray", linewidth=0.5, alpha=0.3)
+
+        # Draw a separator line between groups
+        if level == "mouse" and mouse_group != prev_group and prev_group is not None:
+            for col in range(n_cols):
+                axes[row, col].spines["top"].set_linewidth(2.5)
+                axes[row, col].spines["top"].set_color("#333333")
+        if level == "mouse":
+            prev_group = mouse_group
 
     direction_label = "Forward (anchor → decision)" if direction == "forward" else "Backward (decision ← anchor)"
     fig.suptitle(f"{direction_label} | Level: {level}", fontsize=14, y=1.02)
@@ -525,10 +661,91 @@ def plot_traces_grid(all_traces, config, direction, output_dir, level):
     print(f"  Saved: {output_dir / f'traces_{level}.png'}")
 
 
+def plot_traces_combined_groups(traces_group, config, direction, output_dir):
+    """Single figure: both groups overlaid on each anchor subplot.
+
+    This produces ONE plot with short and long BG traces on the same axes
+    for direct comparison.
+    """
+    anchors = config.ANCHORS
+    groups  = sorted(traces_group.keys())
+
+    # Compute a shared time grid based on window extents across all groups
+    all_windows = []
+    for g in groups:
+        all_windows.extend([t["window_duration"] for t in traces_group[g]])
+    if not all_windows:
+        return
+
+    plot_cap = np.percentile(all_windows, config.PLOT_WINDOW_PERCENTILE)
+
+    if direction == "forward":
+        time_grid = np.arange(0, min(plot_cap + config.POST_DECISION_SEC, 15),
+                              config.BIN_SIZE_MS / 1000)
+    else:
+        time_grid = np.arange(-min(plot_cap, 12), config.POST_DECISION_SEC,
+                              config.BIN_SIZE_MS / 1000)
+
+    if len(time_grid) == 0:
+        return
+
+    fig, axes = plt.subplots(1, len(anchors), figsize=(5 * len(anchors), 4), squeeze=False)
+
+    for col, anchor in enumerate(anchors):
+        ax = axes[0, col]
+
+        for group in groups:
+            traces = [t for t in traces_group[group] if t.get("anchor") == anchor]
+            if len(traces) < 3:
+                continue
+
+            color = config.GROUP_COLORS.get(group, "#555555")
+
+            # Compute summary stats for label
+            slopes  = [compute_slope(t["time_rel"], t["signal"],
+                                     t["window_duration"], direction, config)[0]
+                       for t in traces]
+            windows = [t["window_duration"] for t in traces]
+            r, p, n = compute_correlation(np.array(slopes), np.array(windows))
+
+            # Plot
+            signals, _ = interpolate_traces_to_grid(traces, time_grid)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mean_sig = np.nanmean(signals, axis=0)
+                n_valid  = np.sum(np.isfinite(signals), axis=0)
+                sem_sig  = np.nanstd(signals, axis=0) / np.sqrt(n_valid)
+
+            label = f"{group.upper()} BG (n={n}, r={r:.2f})"
+            ax.plot(time_grid, mean_sig, color=color, linewidth=2, label=label)
+            ax.fill_between(time_grid, mean_sig - sem_sig, mean_sig + sem_sig,
+                            color=color, alpha=0.2)
+
+        # Reference lines
+        if direction == "backward":
+            ax.axvline(0, color="k", linestyle="--", linewidth=1, alpha=0.5, label="Decision")
+        ax.axhline(0, color="gray", linewidth=0.5, alpha=0.3)
+
+        ax.set_title(anchor.replace("_", " ").title(), fontsize=12, fontweight="bold")
+        ax.set_xlabel("Time from decision (s)")
+        ax.set_ylabel("DA (z)" if col == 0 else "")
+        ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+
+    direction_label = "Forward (anchor → decision)" if direction == "forward" else "Backward (decision ← anchor)"
+    fig.suptitle(f"{direction_label} — Short vs Long BG", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(output_dir / "traces_groups_combined.png")
+    plt.close()
+    print(f"  Saved: {output_dir / 'traces_groups_combined.png'}")
+
+
 def plot_slope_scatter(all_traces, config, direction, output_dir, level):
     """Slope vs window duration scatter for each group/mouse × anchor."""
     anchors = config.ANCHORS
-    names   = sorted(all_traces.keys())
+    if level == "mouse":
+        names = sorted(all_traces.keys(), key=lambda m: _mouse_sort_key(m, all_traces))
+    else:
+        names = sorted(all_traces.keys())
     n_rows, n_cols = len(names), len(anchors)
     if n_rows == 0:
         return
@@ -539,10 +756,24 @@ def plot_slope_scatter(all_traces, config, direction, output_dir, level):
         for col, anchor in enumerate(anchors):
             ax = axes[row, col]
             traces = [t for t in all_traces[name] if t.get("anchor") == anchor]
+
+            if level == "mouse":
+                mouse_group = _mouse_group(name, all_traces)
+                color = config.GROUP_COLORS.get(mouse_group, "#555555")
+                ax.set_facecolor(config.GROUP_COLORS.get(mouse_group, "#555555") + "18")
+            elif level == "group":
+                mouse_group = None
+                color = config.GROUP_COLORS.get(name, "#555555")
+            else:
+                mouse_group = None
+                color = config.GROUP_COLORS.get("all")
+
+            group_label = f" ({mouse_group})" if mouse_group else ""
+
             if len(traces) < 10:
                 ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
                         transform=ax.transAxes)
-                ax.set_title(f"{name} | {anchor}")
+                ax.set_title(f"{name}{group_label} | {anchor}")
                 continue
 
             slopes  = np.array([compute_slope(t["time_rel"], t["signal"],
@@ -555,12 +786,8 @@ def plot_slope_scatter(all_traces, config, direction, output_dir, level):
             if len(s) < 10:
                 ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
                         transform=ax.transAxes)
-                ax.set_title(f"{name} | {anchor}")
+                ax.set_title(f"{name}{group_label} | {anchor}")
                 continue
-
-            color = (config.GROUP_COLORS.get("all") if level == "all"
-                     else config.GROUP_COLORS.get(name, "#555555") if level == "group"
-                     else config.MOUSE_COLORS.get(name, "#555555"))
 
             ax.scatter(w, s, c=color, alpha=0.3, s=10, edgecolors="none")
             r, p, n = compute_correlation(slopes, windows)
@@ -573,7 +800,7 @@ def plot_slope_scatter(all_traces, config, direction, output_dir, level):
             ax.set_xlabel("Window duration (s)" if row == n_rows - 1 else "")
             ax.set_ylabel("Slope (z/s)" if col == 0 else "")
             p_str = f"p={p:.3f}" if p >= 0.001 else f"p={p:.1e}"
-            ax.set_title(f"{name} | {anchor}\nr={r:.3f}, {p_str}, n={n}")
+            ax.set_title(f"{name}{group_label} | {anchor}\nr={r:.3f}, {p_str}, n={n}")
 
     direction_label = "Forward" if direction == "forward" else "Backward"
     fig.suptitle(f"Slope vs Window Duration | {direction_label} | Level: {level}",
@@ -693,6 +920,9 @@ def plot_slope_by_quartile(all_traces, config, output_dir, level, anchor):
     names = sorted(all_traces.keys())
     n_q   = config.N_QUARTILES
 
+    if not names:
+        return []
+
     fig, axes = plt.subplots(1, len(names), figsize=(4 * len(names), 5), squeeze=False)
     summary_data = []
 
@@ -745,15 +975,21 @@ def plot_slope_by_quartile(all_traces, config, output_dir, level, anchor):
         ax.set_ylabel("Mean slope (z/s)")
         ax.set_title(name)
 
+        y_range = np.diff(ax.get_ylim())[0]
+        offset  = y_range * 0.04
         for q in range(n_q):
             if ns[q] > 0 and np.isfinite(means[q]) and sems[q] > 0:
                 t_stat = means[q] / sems[q]
                 marker = ("***" if abs(t_stat) > 4 else "**" if abs(t_stat) > 3
                           else "*" if abs(t_stat) > 2 else "")
                 if marker:
-                    y_pos = (means[q] + sems[q] + 0.05 if means[q] > 0
-                             else means[q] - sems[q] - 0.1)
-                    ax.text(q, y_pos, marker, ha="center", fontsize=12)
+                    if means[q] > 0:
+                        y_pos = means[q] + sems[q] + offset
+                        va    = "bottom"
+                    else:
+                        y_pos = means[q] - sems[q] - offset
+                        va    = "top"
+                    ax.text(q, y_pos, marker, ha="center", va=va, fontsize=12)
 
     fig.suptitle(f"Mean Slope by Wait Quartile | {anchor} | Level: {level}",
                  fontsize=14, y=1.02)
@@ -868,11 +1104,18 @@ def run_exploration(config: Config):
                 traces_group[trial.group].append(trace)
                 traces_mouse[trial.mouse].append(trace)
 
+        # --- Filter extremely long windows ---
+        print("\nFiltering long-window trials...")
+        traces_all, traces_group, traces_mouse = filter_long_windows(
+            traces_all, traces_group, traces_mouse, config
+        )
+
         # --- Standard exploration plots ---
         print("\nPlotting average traces...")
         plot_traces_grid(traces_all,   config, direction, trace_dir, "all")
         plot_traces_grid(traces_group, config, direction, trace_dir, "group")
         plot_traces_grid(traces_mouse, config, direction, trace_dir, "mouse")
+        plot_traces_combined_groups(traces_group, config, direction, trace_dir)
 
         print("\nPlotting slope correlations...")
         plot_slope_scatter(traces_all,   config, direction, scatter_dir, "all")
@@ -978,14 +1221,17 @@ def run_exploration(config: Config):
     print("KEY FINDINGS")
     print("=" * 70)
     summary_df = pd.DataFrame(summary_rows)
-    for direction in ["forward", "backward"]:
-        print(f"\n{direction.upper()}:")
-        group_df = summary_df[(summary_df["direction"] == direction) &
-                               (summary_df["level"] == "group")]
-        for _, row in group_df.iterrows():
-            sig = "*" if row["p_slope_window"] < 0.05 else ""
-            print(f"  {row['name']:6s} | {row['anchor']:10s} | r={row['r_slope_window']:+.3f}{sig} | "
-                  f"slope={row['mean_slope']:+.3f} | n={row['n_trials']}")
+    if summary_df.empty or "direction" not in summary_df.columns:
+        print("  No summary data — check that sessions passed the tier/short-session filter.")
+    else:
+        for direction in ["forward", "backward"]:
+            print(f"\n{direction.upper()}:")
+            group_df = summary_df[(summary_df["direction"] == direction) &
+                                   (summary_df["level"] == "group")]
+            for _, row in group_df.iterrows():
+                sig = "*" if row["p_slope_window"] < 0.05 else ""
+                print(f"  {row['name']:6s} | {row['anchor']:10s} | r={row['r_slope_window']:+.3f}{sig} | "
+                      f"slope={row['mean_slope']:+.3f} | n={row['n_trials']}")
 
     print(f"\nDone! All outputs in: {config.OUTPUT_DIR}")
 

@@ -2,9 +2,19 @@
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Paths — all data lives on the external drive
+# === CONFIGURE THESE FOR YOUR MACHINE ===
+# Edit these two paths after cloning to a new computer.
 # ---------------------------------------------------------------------------
+
+# Root of your photometry external drive (e.g. T7 Shield mount point):
 PHOTO_ROOT = Path("/Volumes/T7 Shield/photometry")
+
+# Local directory containing raw behavior data:
+BEHAVIOR_DATA_DIR = Path("/Users/rebekahzhang/data/behavior_data")
+
+# ---------------------------------------------------------------------------
+# Derived paths — all computed from PHOTO_ROOT, no edits needed below
+# ---------------------------------------------------------------------------
 PROCESSED_OUT = PHOTO_ROOT / "fp_processed"
 BEHAV_DIR = PHOTO_ROOT / "behav_analyzed"
 OUT_PLOTS_DIR = PHOTO_ROOT / "trial_plots"
@@ -14,8 +24,11 @@ QC_OUT_DIR = PHOTO_ROOT / "quality_control"
 FP_DIR = PHOTO_ROOT / "fp"
 FP_DIR_FLATTENED = PHOTO_ROOT / "fp_flattened"
 
-# Behavior data (still on internal drive — not moved)
-BEHAVIOR_DATA_DIR = Path("/Users/rebekahzhang/data/behavior_data")
+# Analysis / figure output directories
+COMMITTEE_FIGURES_DIR  = PHOTO_ROOT / "committee_figures"
+DA_RAMP_DIR            = PHOTO_ROOT / "da_ramp_analysis"
+TRIAL_HISTORY_V2_DIR   = PHOTO_ROOT / "trial_history_results_v2"
+TRIAL_HISTORY_V3_DIR   = PHOTO_ROOT / "trial_history_results_v3"
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -67,6 +80,17 @@ NON_IMPULSIVE_CUTOFF = 0.5  # seconds; trials below this are considered impulsiv
 QC_GATE_ENABLED = True
 QC_STOP_ON_FAIL = False
 QC_MIN_SAMPLES_PER_STATE = 50
+
+# ---------------------------------------------------------------------------
+# Group colors (short BG = yellow, long BG = purple)
+# ---------------------------------------------------------------------------
+GROUP_COLORS: dict[str, str] = {
+    "short": "#ffb400",
+    "s":     "#ffb400",
+    "long":  "#9080ff",
+    "l":     "#9080ff",
+    "all":   "#555555",
+}
 
 # ---------------------------------------------------------------------------
 # Pipeline session log
